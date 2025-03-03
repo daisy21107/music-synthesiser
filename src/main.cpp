@@ -1,3 +1,10 @@
+// -------------------- Configuration --------------------
+#define MODULE_MODE_SENDER       // Uncomment to compile as a sender
+// #define MODULE_MODE_RECEIVER   // Uncomment to compile as a receiver
+
+// Set the module's octave (0-8)
+#define MODULE_OCTAVE 4
+
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <bitset>
@@ -70,7 +77,7 @@ const int HKOE_BIT = 6;
 // Global variable to store current step size for audio generation
 volatile uint32_t currentStepSize = 0;
 
-// Knob class definition
+// -------------------- Knob Class --------------------
 class Knob {
 private:
   std::atomic<int32_t> rotation;
@@ -119,14 +126,11 @@ public:
 
 Knob knob3(0, 8);
 
-// Timer object
+// -------------------- Timer & Display --------------------
 HardwareTimer sampleTimer(TIM1);
-
-// Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-// -----------------------------------------------------------------------------
-// Helper functions for the key matrix
+// -------------------- Helper Functions for Key Matrix --------------------
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, bitIdx & 0x01);
@@ -155,8 +159,8 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
-// -----------------------------------------------------------------------------
-// CAN Rx ISR: quickly store incoming message into the queue
+// -------------------- CAN ISRs --------------------
+// CAN Rx ISR: quickly store incoming message into msgInQ
 extern "C" void myCanRxISR(void) {
   uint8_t RX_Message_ISR[8];
   uint32_t ID;
@@ -164,7 +168,6 @@ extern "C" void myCanRxISR(void) {
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
-// -----------------------------------------------------------------------------
 // CAN Tx ISR: signals that a mailbox is free by giving the semaphore
 extern "C" void myCanTxISR(void) {
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -172,13 +175,13 @@ extern "C" void myCanTxISR(void) {
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-// -----------------------------------------------------------------------------
-// decodeTask: blocks on xQueueReceive(msgInQ, ...), updates stepSize, saves message
+// -------------------- Receiver: Decode Task --------------------
+#ifdef MODULE_MODE_RECEIVER
 void decodeTask(void *pvParameters) {
   uint8_t localMsg[8];
   while (1) {
     if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
-      if (localMsg[0] == 'P') {
+      if (localMsg[0] == 'P') { // Key pressed
         uint8_t octave = localMsg[1];
         uint8_t note   = localMsg[2];
         uint32_t step  = stepSizes[note];
@@ -188,7 +191,7 @@ void decodeTask(void *pvParameters) {
           step >>= (4 - octave);
         }
         __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-      } else if (localMsg[0] == 'R') {
+      } else if (localMsg[0] == 'R') { // Key released
         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
@@ -197,9 +200,10 @@ void decodeTask(void *pvParameters) {
     }
   }
 }
+#endif
 
-// -----------------------------------------------------------------------------
-// CAN_TX_Task: takes messages from msgOutQ, waits for a free mailbox, then sends them
+// -------------------- Transmit Task (Sender Mode) --------------------
+#ifdef MODULE_MODE_SENDER
 void CAN_TX_Task(void * pvParameters) {
   uint8_t msgOut[8];
   while (1) {
@@ -208,9 +212,9 @@ void CAN_TX_Task(void * pvParameters) {
     CAN_TX(0x123, msgOut);
   }
 }
+#endif
 
-// -----------------------------------------------------------------------------
-// scanKeysTask: scans local keys and enqueues messages into msgOutQ
+// -------------------- scanKeysTask --------------------
 void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -229,17 +233,21 @@ void scanKeysTask(void * pvParameters) {
         all_inputs[index] = result[col];
       }
     }
+    // In sender mode, local key changes are enqueued for transmission.
+    #ifdef MODULE_MODE_SENDER
     for (uint8_t i = 0; i < 12; i++) {
       bool currentPressed = !all_inputs[i];  // LOW means pressed
       if (currentPressed != prevKeyPressed[i]) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        TX_Message[1] = 4;    // Octave 4
-        TX_Message[2] = i;    // Note number
+        TX_Message[1] = MODULE_OCTAVE;
+        TX_Message[2] = i;
         xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
         prevKeyPressed[i] = currentPressed;
       }
     }
+    #endif
+    // Optionally, both modes update local state:
     knob3.update((all_inputs[13] << 1) | all_inputs[12]);
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = all_inputs;
@@ -247,8 +255,7 @@ void scanKeysTask(void * pvParameters) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// displayUpdateTask: displays the latest sysState.RX_Message
+// -------------------- displayUpdateTask --------------------
 void displayUpdateTask(void * pvParameters) {
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -289,8 +296,8 @@ void displayUpdateTask(void * pvParameters) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Audio generation ISR
+// -------------------- Audio Generation ISR --------------------
+#ifdef MODULE_MODE_RECEIVER
 void sampleISR() {
   static uint32_t phaseAcc = 0;
   uint32_t localCurrentStepSize;
@@ -300,9 +307,14 @@ void sampleISR() {
   Vout = Vout >> (8 - knob3.getRotation());
   analogWrite(OUTR_PIN, Vout + 128);
 }
+#else
+// In sender mode, no audio is generated.
+void sampleISR() {
+  analogWrite(OUTR_PIN, 128); // idle output
+}
+#endif
 
-// -----------------------------------------------------------------------------
-// setup(): create tasks, init CAN in loopback, set up queues, register ISRs
+// -------------------- setup() --------------------
 void setup() {
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
@@ -318,53 +330,48 @@ void setup() {
   pinMode(C3_PIN, INPUT);
   pinMode(JOYX_PIN, INPUT);
   pinMode(JOYY_PIN, INPUT);
-
   setOutMuxBit(DRST_BIT, LOW);
   delayMicroseconds(2);
   setOutMuxBit(DRST_BIT, HIGH);
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);
-
   Serial.begin(9600);
   Serial.println("Hello World");
-
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
-
-  // Create tasks
+  // Create tasks. In sender mode, create scanKeysTask and CAN_TX_Task.
+  #ifdef MODULE_MODE_SENDER
   xTaskCreate(scanKeysTask,      "scanKeys",      128, NULL, 2, NULL);
-  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, NULL);
-  xTaskCreate(decodeTask,        "decodeTask",    128, NULL, 2, NULL);
   xTaskCreate(CAN_TX_Task,       "CAN_TX_Task",   128, NULL, 2, NULL);
-
+  #endif
+  // In receiver mode, create decodeTask.
+  #ifdef MODULE_MODE_RECEIVER
+  xTaskCreate(decodeTask,        "decodeTask",    128, NULL, 2, NULL);
+  #endif
+  // displayUpdateTask runs in both modes.
+  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, NULL);
+  // Also, optionally, scanKeysTask could run in receiver mode to capture local keys, if desired.
+  // For now, we assume sender mode handles key scanning.
   sysState.mutex = xSemaphoreCreateMutex();
-
-  // Create the incoming queue (msgInQ) and outgoing queue (msgOutQ)
   msgInQ  = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(36, 8);
   if (!msgInQ || !msgOutQ) {
     Serial.println("Error: Could not create queues!");
     while (1);
   }
-
-  // Create a counting semaphore with a count of 3 for the 3 CAN TX mailboxes
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
   if (!CAN_TX_Semaphore) {
     Serial.println("Error: Could not create CAN_TX_Semaphore!");
     while (1);
   }
-
   // Initialize and start CAN in loopback mode
   CAN_Init(true);
   setCANFilter(0x123, 0x7ff);
-
   // Register our CAN Rx and Tx ISRs
   CAN_RegisterRX_ISR(myCanRxISR);
   CAN_RegisterTX_ISR(myCanTxISR);
-
   CAN_Start();
-
   vTaskStartScheduler();
 }
 
