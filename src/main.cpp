@@ -11,8 +11,10 @@
 #include <stm32l4xx_hal_cortex.h>
 #include <ES_CAN.h>   // Provided CAN library
 
-// ------------------------- Queue and Extended SysState -------------------------
-QueueHandle_t msgInQ = NULL; // FreeRTOS queue for incoming CAN messages
+// -------------------- FreeRTOS Queues and Semaphores --------------------
+QueueHandle_t msgInQ  = NULL;  // For incoming messages
+QueueHandle_t msgOutQ = NULL;  // For outgoing messages
+SemaphoreHandle_t CAN_TX_Semaphore = NULL;  // Counting semaphore for TX mailboxes
 
 // We store the latest received message in sysState, protected by sysState.mutex
 struct {
@@ -158,35 +160,37 @@ void setRow(uint8_t rowIdx) {
 extern "C" void myCanRxISR(void) {
   uint8_t RX_Message_ISR[8];
   uint32_t ID;
-  // Read from the FIFO (assumes at least one message is waiting)
   CAN_RX(ID, RX_Message_ISR);
-  // Push it into the FreeRTOS queue
   xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
 // -----------------------------------------------------------------------------
-// decodeTask: blocks on xQueueReceive, updates step size, and saves message
+// CAN Tx ISR: signals that a mailbox is free by giving the semaphore
+extern "C" void myCanTxISR(void) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(CAN_TX_Semaphore, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// -----------------------------------------------------------------------------
+// decodeTask: blocks on xQueueReceive(msgInQ, ...), updates stepSize, saves message
 void decodeTask(void *pvParameters) {
   uint8_t localMsg[8];
   while (1) {
-    // Block until a message arrives in the queue
     if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
-      // Update currentStepSize based on the message
-      if (localMsg[0] == 'P') {   // Key pressed
+      if (localMsg[0] == 'P') {
         uint8_t octave = localMsg[1];
         uint8_t note   = localMsg[2];
         uint32_t step  = stepSizes[note];
         if (octave > 4) {
-          step <<= (octave - 4);  // multiply by 2^(octave-4)
+          step <<= (octave - 4);
         } else if (octave < 4) {
-          step >>= (4 - octave);  // divide by 2^(4-octave)
+          step >>= (4 - octave);
         }
         __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-      }
-      else if (localMsg[0] == 'R') {  // Key released
+      } else if (localMsg[0] == 'R') {
         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
-      // Copy the message into sysState.RX_Message for display
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       memcpy(sysState.RX_Message, localMsg, 8);
       xSemaphoreGive(sysState.mutex);
@@ -195,20 +199,27 @@ void decodeTask(void *pvParameters) {
 }
 
 // -----------------------------------------------------------------------------
-// scanKeysTask: local scanning for this keyboard's keys 
+// CAN_TX_Task: takes messages from msgOutQ, waits for a free mailbox, then sends them
+void CAN_TX_Task(void * pvParameters) {
+  uint8_t msgOut[8];
+  while (1) {
+    xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+    xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+    CAN_TX(0x123, msgOut);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// scanKeysTask: scans local keys and enqueues messages into msgOutQ
 void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
   static bool prevKeyPressed[12] = {
     true, true, true, true, true, true, true, true, true, true, true, true
   };
-
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     std::bitset<32> all_inputs;
-    int lastKeyPressed = -1;  // For local audio
-
     for (uint8_t row = 0; row < 4; row++) {
       setRow(row);
       delayMicroseconds(3);
@@ -216,30 +227,20 @@ void scanKeysTask(void * pvParameters) {
       for (uint8_t col = 0; col < 4; col++) {
         int index = row * 4 + col;
         all_inputs[index] = result[col];
-        if (index < 12 && !result[col]) {
-          lastKeyPressed = index;
-        }
       }
     }
-    int MODULE_OCTAVE = 4;
-    
     for (uint8_t i = 0; i < 12; i++) {
-      bool currentPressed = !all_inputs[i];  // LOW indicates pressed
+      bool currentPressed = !all_inputs[i];  // LOW means pressed
       if (currentPressed != prevKeyPressed[i]) {
-        // Build a local TX_Message for the changed key
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        TX_Message[1] = MODULE_OCTAVE;
-        TX_Message[2] = i;
-        // Send the message over CAN with ID 0x123
-        CAN_TX(0x123, TX_Message);
+        TX_Message[1] = 4;    // Octave 4
+        TX_Message[2] = i;    // Note number
+        xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
         prevKeyPressed[i] = currentPressed;
       }
     }
-
-    // Update knob rotation (using bits 12 and 13 from the matrix)
     knob3.update((all_inputs[13] << 1) | all_inputs[12]);
-
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = all_inputs;
     xSemaphoreGive(sysState.mutex);
@@ -253,7 +254,6 @@ void displayUpdateTask(void * pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
     const char* pressedKey = "None";
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     for (int i = 0; i < 12; i++) {
@@ -264,14 +264,12 @@ void displayUpdateTask(void * pvParameters) {
     uint8_t localCopy[8];
     memcpy(localCopy, sysState.RX_Message, 8);
     xSemaphoreGive(sysState.mutex);
-
     Serial.print("Local pressed key: ");
     Serial.print(pressedKey);
     Serial.print(", Current stepSize: ");
     Serial.print(currentStepSize);
     Serial.print(", Volume: ");
     Serial.println(knob3.getRotation());
-
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
     u8g2.drawStr(2, 10, "Local Key: ");
@@ -287,7 +285,6 @@ void displayUpdateTask(void * pvParameters) {
     u8g2.print(localCopy[1]);
     u8g2.print(localCopy[2]);
     u8g2.sendBuffer();
-
     digitalToggle(LED_BUILTIN);
   }
 }
@@ -305,7 +302,7 @@ void sampleISR() {
 }
 
 // -----------------------------------------------------------------------------
-// setup(): create tasks, init CAN in loopback, set up queue, register ISR
+// setup(): create tasks, init CAN in loopback, set up queues, register ISRs
 void setup() {
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
@@ -335,28 +332,36 @@ void setup() {
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
-  TaskHandle_t scanKeysHandle = NULL;
-  xTaskCreate(scanKeysTask, "scanKeys", 128, NULL, 2, &scanKeysHandle);
-
-  TaskHandle_t displayUpdateHandle = NULL;
-  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, &displayUpdateHandle);
-
-  TaskHandle_t decoderHandle = NULL;
-  xTaskCreate(decodeTask, "decodeTask", 128, NULL, 2, &decoderHandle);
+  // Create tasks
+  xTaskCreate(scanKeysTask,      "scanKeys",      128, NULL, 2, NULL);
+  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, NULL);
+  xTaskCreate(decodeTask,        "decodeTask",    128, NULL, 2, NULL);
+  xTaskCreate(CAN_TX_Task,       "CAN_TX_Task",   128, NULL, 2, NULL);
 
   sysState.mutex = xSemaphoreCreateMutex();
 
-  msgInQ = xQueueCreate(36, 8);
-  if (!msgInQ) {
-    Serial.println("Error: Could not create msgInQ!");
+  // Create the incoming queue (msgInQ) and outgoing queue (msgOutQ)
+  msgInQ  = xQueueCreate(36, 8);
+  msgOutQ = xQueueCreate(36, 8);
+  if (!msgInQ || !msgOutQ) {
+    Serial.println("Error: Could not create queues!");
     while (1);
   }
 
+  // Create a counting semaphore with a count of 3 for the 3 CAN TX mailboxes
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3, 3);
+  if (!CAN_TX_Semaphore) {
+    Serial.println("Error: Could not create CAN_TX_Semaphore!");
+    while (1);
+  }
+
+  // Initialize and start CAN in loopback mode
   CAN_Init(true);
   setCANFilter(0x123, 0x7ff);
 
-  // Register our renamed CAN RX ISR
+  // Register our CAN Rx and Tx ISRs
   CAN_RegisterRX_ISR(myCanRxISR);
+  CAN_RegisterTX_ISR(myCanTxISR);
 
   CAN_Start();
 
