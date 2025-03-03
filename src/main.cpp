@@ -11,12 +11,22 @@
 #include <stm32l4xx_hal_cortex.h>
 #include <ES_CAN.h>   // Provided CAN library
 
-// Global outgoing message array (8 bytes)
-volatile uint8_t TX_Message[8] = {0};
+// ------------------------- Queue and Extended SysState -------------------------
+QueueHandle_t msgInQ = NULL; // FreeRTOS queue for incoming CAN messages
+
+// We store the latest received message in sysState, protected by sysState.mutex
+struct {
+  std::bitset<32> inputs;
+  SemaphoreHandle_t mutex;
+  uint8_t RX_Message[8];  // Global buffer for the latest incoming CAN frame
+} sysState;
 
 // Constants
-const char* noteNames[12] = {"C4", "C#4", "D4", "D#4", "E4", "F4", 
-                             "F#4", "G4", "G#4", "A4", "A#4", "B4"};
+const char* noteNames[12] = {
+  "C4", "C#4", "D4", "D#4", "E4", "F4", 
+  "F#4", "G4", "G#4", "A4", "A#4", "B4"
+};
+
 const uint32_t stepSizes[12] = {
   51076056, // C4
   54113197, // C#4
@@ -32,29 +42,24 @@ const uint32_t stepSizes[12] = {
   96418755  // B4
 };
 
-//Pin definitions
-//Row select and enable
+// Pin definitions
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
 const int RA2_PIN = D12;
 const int REN_PIN = A5;
 
-// Matrix input and output
 const int C0_PIN = A2;
 const int C1_PIN = D9;
 const int C2_PIN = A6;
 const int C3_PIN = D1;
 const int OUT_PIN = D11;
 
-// Audio analogue out
 const int OUTL_PIN = A4;
 const int OUTR_PIN = A3;
 
-// Joystick analogue in
 const int JOYY_PIN = A0;
 const int JOYX_PIN = A1;
 
-// Output multiplexer bits
 const int DEN_BIT = 3;
 const int DRST_BIT = 4;
 const int HKOW_BIT = 5;
@@ -112,19 +117,14 @@ public:
 
 Knob knob3(0, 8);
 
-// Global struct to store shared system state (for key matrix scanning)
-struct {
-  std::bitset<32> inputs;
-  SemaphoreHandle_t mutex;
-} sysState;
-
 // Timer object
 HardwareTimer sampleTimer(TIM1);
 
 // Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
-// Function to set outputs using the key matrix
+// -----------------------------------------------------------------------------
+// Helper functions for the key matrix
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
   digitalWrite(REN_PIN, LOW);
   digitalWrite(RA0_PIN, bitIdx & 0x01);
@@ -153,20 +153,62 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
-// scanKeysTask: Detect key state changes and update the global TX_Message, then send via CAN_TX()
+// -----------------------------------------------------------------------------
+// CAN Rx ISR: quickly store incoming message into the queue
+extern "C" void myCanRxISR(void) {
+  uint8_t RX_Message_ISR[8];
+  uint32_t ID;
+  // Read from the FIFO (assumes at least one message is waiting)
+  CAN_RX(ID, RX_Message_ISR);
+  // Push it into the FreeRTOS queue
+  xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
+
+// -----------------------------------------------------------------------------
+// decodeTask: blocks on xQueueReceive, updates step size, and saves message
+void decodeTask(void *pvParameters) {
+  uint8_t localMsg[8];
+  while (1) {
+    // Block until a message arrives in the queue
+    if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
+      // Update currentStepSize based on the message
+      if (localMsg[0] == 'P') {   // Key pressed
+        uint8_t octave = localMsg[1];
+        uint8_t note   = localMsg[2];
+        uint32_t step  = stepSizes[note];
+        if (octave > 4) {
+          step <<= (octave - 4);  // multiply by 2^(octave-4)
+        } else if (octave < 4) {
+          step >>= (4 - octave);  // divide by 2^(4-octave)
+        }
+        __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+      }
+      else if (localMsg[0] == 'R') {  // Key released
+        __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+      }
+      // Copy the message into sysState.RX_Message for display
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      memcpy(sysState.RX_Message, localMsg, 8);
+      xSemaphoreGive(sysState.mutex);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// scanKeysTask: local scanning for this keyboard's keys 
 void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  // Array to store previous state for 12 piano keys (true = not pressed)
-  static bool prevKeyPressed[12] = { true, true, true, true, true, true, true, true, true, true, true, true };
+  static bool prevKeyPressed[12] = {
+    true, true, true, true, true, true, true, true, true, true, true, true
+  };
 
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     std::bitset<32> all_inputs;
-    int lastKeyPressed = -1;  // For audio tone generation
+    int lastKeyPressed = -1;  // For local audio
 
-    // Scan the 4x4 key matrix
     for (uint8_t row = 0; row < 4; row++) {
       setRow(row);
       delayMicroseconds(3);
@@ -174,26 +216,23 @@ void scanKeysTask(void * pvParameters) {
       for (uint8_t col = 0; col < 4; col++) {
         int index = row * 4 + col;
         all_inputs[index] = result[col];
-        if (index < 12 && !result[col]) {  // For audio generation when key is pressed
+        if (index < 12 && !result[col]) {
           lastKeyPressed = index;
         }
       }
     }
-
     int MODULE_OCTAVE = 4;
     
-    // For each piano key, detect state changes and update global TX_Message
     for (uint8_t i = 0; i < 12; i++) {
       bool currentPressed = !all_inputs[i];  // LOW indicates pressed
       if (currentPressed != prevKeyPressed[i]) {
-        TX_Message[0] = currentPressed ? 'P' : 'R';  // 'P' for press, 'R' for release
-        TX_Message[1] = MODULE_OCTAVE;               // Octave number
-        TX_Message[2] = i;                           // Note number
-        // The rest of TX_Message remains 0
-
-        // Send the message over CAN using fixed ID 0x123
-        CAN_TX(0x123, (uint8_t*)TX_Message);
-
+        // Build a local TX_Message for the changed key
+        uint8_t TX_Message[8] = {0};
+        TX_Message[0] = currentPressed ? 'P' : 'R';
+        TX_Message[1] = MODULE_OCTAVE;
+        TX_Message[2] = i;
+        // Send the message over CAN with ID 0x123
+        CAN_TX(0x123, TX_Message);
         prevKeyPressed[i] = currentPressed;
       }
     }
@@ -201,21 +240,14 @@ void scanKeysTask(void * pvParameters) {
     // Update knob rotation (using bits 12 and 13 from the matrix)
     knob3.update((all_inputs[13] << 1) | all_inputs[12]);
 
-    // Update shared system state
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     sysState.inputs = all_inputs;
     xSemaphoreGive(sysState.mutex);
-
-    // Determine step size for audio generation based on last key pressed
-    uint32_t localCurrentStepSize = 0;
-    if (lastKeyPressed != -1) {
-      localCurrentStepSize = stepSizes[lastKeyPressed];
-    }
-    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
   }
 }
 
-// displayUpdateTask: Display the latest TX_Message on the OLED
+// -----------------------------------------------------------------------------
+// displayUpdateTask: displays the latest sysState.RX_Message
 void displayUpdateTask(void * pvParameters) {
   const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -229,35 +261,39 @@ void displayUpdateTask(void * pvParameters) {
         pressedKey = noteNames[i];
       }
     }
+    uint8_t localCopy[8];
+    memcpy(localCopy, sysState.RX_Message, 8);
     xSemaphoreGive(sysState.mutex);
 
-    Serial.print("Pressed key: ");
+    Serial.print("Local pressed key: ");
     Serial.print(pressedKey);
-    Serial.print(", Step size: ");
+    Serial.print(", Current stepSize: ");
     Serial.print(currentStepSize);
     Serial.print(", Volume: ");
     Serial.println(knob3.getRotation());
 
-    // Update display with key info
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(2, 10, "Pressed key: ");
-    u8g2.setCursor(75, 10);
+    u8g2.drawStr(2, 10, "Local Key: ");
+    u8g2.setCursor(70, 10);
     u8g2.print(pressedKey);
     u8g2.drawStr(2, 20, "Volume:");
-    u8g2.setCursor(75, 20);
+    u8g2.setCursor(70, 20);
     u8g2.print(knob3.getRotation());
-    // Display the latest TX_Message
-    u8g2.setCursor(66, 30);
-    u8g2.print((char)TX_Message[0]);  // Cast first byte to char
-    u8g2.print(TX_Message[1]);
-    u8g2.print(TX_Message[2]);
+    u8g2.setCursor(2, 30);
+    u8g2.print("RX Msg: ");
+    u8g2.setCursor(50, 30);
+    u8g2.print((char)localCopy[0]);
+    u8g2.print(localCopy[1]);
+    u8g2.print(localCopy[2]);
     u8g2.sendBuffer();
 
     digitalToggle(LED_BUILTIN);
   }
 }
 
+// -----------------------------------------------------------------------------
+// Audio generation ISR
 void sampleISR() {
   static uint32_t phaseAcc = 0;
   uint32_t localCurrentStepSize;
@@ -268,8 +304,9 @@ void sampleISR() {
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
+// -----------------------------------------------------------------------------
+// setup(): create tasks, init CAN in loopback, set up queue, register ISR
 void setup() {
-  // Set pin directions
   pinMode(RA0_PIN, OUTPUT);
   pinMode(RA1_PIN, OUTPUT);
   pinMode(RA2_PIN, OUTPUT);
@@ -285,40 +322,47 @@ void setup() {
   pinMode(JOYX_PIN, INPUT);
   pinMode(JOYY_PIN, INPUT);
 
-  // Initialize display
   setOutMuxBit(DRST_BIT, LOW);
   delayMicroseconds(2);
   setOutMuxBit(DRST_BIT, HIGH);
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);
 
-  // Initialize UART
   Serial.begin(9600);
   Serial.println("Hello World");
 
-  // Timer and interrupt setup
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
 
-  // Create RTOS tasks
   TaskHandle_t scanKeysHandle = NULL;
-  xTaskCreate(scanKeysTask, "scanKeys", 64, NULL, 2, &scanKeysHandle);
+  xTaskCreate(scanKeysTask, "scanKeys", 128, NULL, 2, &scanKeysHandle);
+
   TaskHandle_t displayUpdateHandle = NULL;
   xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, &displayUpdateHandle);
-  
-  // Create mutex for shared system state
+
+  TaskHandle_t decoderHandle = NULL;
+  xTaskCreate(decodeTask, "decodeTask", 128, NULL, 2, &decoderHandle);
+
   sysState.mutex = xSemaphoreCreateMutex();
 
-  // Initialize CAN bus in loopback mode, set filter, and start CAN hardware
+  msgInQ = xQueueCreate(36, 8);
+  if (!msgInQ) {
+    Serial.println("Error: Could not create msgInQ!");
+    while (1);
+  }
+
   CAN_Init(true);
   setCANFilter(0x123, 0x7ff);
+
+  // Register our renamed CAN RX ISR
+  CAN_RegisterRX_ISR(myCanRxISR);
+
   CAN_Start();
 
-  // Start the RTOS scheduler
   vTaskStartScheduler();
 }
 
 void loop() {
-  // Main loop remains empty; functionality is handled in tasks.
+  // FreeRTOS tasks handle everything.
 }
