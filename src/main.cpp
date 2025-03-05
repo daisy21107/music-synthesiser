@@ -363,14 +363,18 @@ void setup() {
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
   // Create tasks for both sender and receiver functions.
-  xTaskCreate(scanKeysTask,      "scanKeys",      128, NULL, 2, NULL);
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(scanKeysTask,      "scanKeys",      128, NULL, 2, &scanKeysHandle);
   #ifdef MODULE_MODE_SENDER
-  xTaskCreate(CAN_TX_Task,       "CAN_TX_Task",   128, NULL, 2, NULL);
+  TaskHandle_t CAN_TXHandle = NULL;  
+  xTaskCreate(CAN_TX_Task,       "CAN_TX_Task",   128, NULL, 2, &CAN_TXHandle);
   #endif
   #ifdef MODULE_MODE_RECEIVER
-  xTaskCreate(decodeTask,        "decodeTask",    128, NULL, 2, NULL);
+  TaskHandle_t decodeHandle = NULL;  
+  xTaskCreate(decodeTask,        "decodeTask",    128, NULL, 2, &decodeHandle);
   #endif
-  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, NULL);
+  TaskHandle_t displayUpdateHandle = NULL;  
+  xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, &displayUpdateHandle);
   sysState.mutex = xSemaphoreCreateMutex();
   msgInQ  = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(36, 8);
