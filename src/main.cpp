@@ -2,6 +2,9 @@
 #define MODULE_MODE_SENDER       // Enable sending: local key changes will be transmitted
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
+// We will need to set 1 keyboard to be both Sender&Receiver.
+// Other 2 keyboards will be only the Sender (To make only one keyboard to play the sound)
+
 // Set the module's octave (0-8); this is used locally when sending.
 #define MODULE_OCTAVE 4
 
