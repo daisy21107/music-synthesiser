@@ -91,22 +91,16 @@ public:
   void update(uint8_t currState) {
     int32_t localRotation = rotation.load();
     if ((prevState == 0b00 && currState == 0b01) ||
-        (prevState == 0b01 && currState == 0b11) ||
-        (prevState == 0b11 && currState == 0b10) ||
-        (prevState == 0b10 && currState == 0b00)) {
-      localRotation++;
-      lastDirection = 1;
-    } else if ((prevState == 0b00 && currState == 0b10) ||
-               (prevState == 0b10 && currState == 0b11) ||
-               (prevState == 0b11 && currState == 0b01) ||
-               (prevState == 0b01 && currState == 0b00)) {
-      localRotation--;
-      lastDirection = -1;
+        (prevState == 0b11 && currState == 0b10)) { // Clockwise
+        localRotation++;
+        lastDirection = 1;
+    } else if ((prevState == 0b10 && currState == 0b11) ||
+               (prevState == 0b01 && currState == 0b00)) { // Anticlockwise
+        localRotation--;
+        lastDirection = -1;
     } else if ((prevState == 0b00 && currState == 0b11) ||
-               (prevState == 0b01 && currState == 0b10) ||
-               (prevState == 0b10 && currState == 0b01) ||
-               (prevState == 0b11 && currState == 0b00)) {
-      localRotation += lastDirection;
+               (prevState == 0b11 && currState == 0b00)) { // Impossible/illegal transitions
+        localRotation += lastDirection;
     }
     if (localRotation < lowerLimit) localRotation = lowerLimit;
     if (localRotation > upperLimit) localRotation = upperLimit;
@@ -390,7 +384,7 @@ void setup() {
     Serial.println("Error: Could not create CAN_TX_Semaphore!");
     while (1);
   }
-  CAN_Init(false);
+  CAN_Init(true); 
   setCANFilter(0x123, 0x7ff);
   CAN_RegisterRX_ISR(myCanRxISR);
   CAN_RegisterTX_ISR(myCanTxISR);
