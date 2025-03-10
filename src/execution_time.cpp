@@ -13,8 +13,8 @@
 // 1 = test scanKeysIteration() execution time        : ~1468 µs for 32 iterations (~46 µs per iteration)
 // 2 = test display update execution time             : ~1,666,056 µs for 32 iterations (~52 ms per iteration)
 // 3 = test decodeTask() processing iteration         : ~129 µs for 32 iterations (~4 µs per iteration)
-// 4 = test CAN_TX_Task() processing iteration        : ~ 74 µs for 32 iterations (~2.3 µs per iteration)
-// 5 = test sampleISR() execution time                : ~ 290 µs for 32 iterations (~9 µs per iteration)
+// 4 = test CAN_TX_Task() processing iteration        : ~74 µs for 32 iterations (~2.3 µs per iteration)
+// 5 = test sampleISR() execution time                : ~290 µs for 32 iterations (~9 µs per iteration)
 #ifndef TEST_MODE
   #define TEST_MODE 0
 #endif
@@ -336,7 +336,7 @@ void testDecodeIteration() {
     if (octave > 4)
       step <<= (octave - 4);
     else if (octave < 4)
-      step >>= (4 - MODULE_OCTAVE);
+      step >>= (4 - octave);
     __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
   } else if (testMsg[0] == 'R') {
     __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
