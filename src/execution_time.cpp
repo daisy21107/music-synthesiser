@@ -16,7 +16,7 @@
 // 4 = test CAN_TX_Task() processing iteration        : ~ 74 µs for 32 iterations (~2.3 µs per iteration)
 // 5 = test sampleISR() execution time                : ~ 290 µs for 32 iterations (~9 µs per iteration)
 #ifndef TEST_MODE
-  #define TEST_MODE 5
+  #define TEST_MODE 0
 #endif
 
 #if TEST_MODE != 0
@@ -489,7 +489,7 @@ void setup() {
   // Create the RTOS objects needed by the test functions.
   sysState.mutex = xSemaphoreCreateMutex();
   msgInQ  = xQueueCreate(36, 8);
-  msgOutQ = xQueueCreate(36, 8);
+  msgOutQ = xQueueCreate(384, 8);
   if (!msgInQ || !msgOutQ) {
     Serial.println("Error: Could not create queues!");
     while (1);
