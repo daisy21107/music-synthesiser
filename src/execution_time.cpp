@@ -2,8 +2,8 @@
 #define MODULE_MODE_SENDER       // Enable sending: local key changes will be transmitted
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
-// Set the module's octave (0-8); this is used locally when sending.
-#define MODULE_OCTAVE 4
+// Set the module's octave (1-7); this is used locally when sending.
+// #define MODULE_OCTAVE 4
 
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
@@ -68,6 +68,8 @@ const uint32_t stepSizes[12] = {
   91007186, // A#4
   96418755  // B4
 };
+
+volatile std::atomic<bool> octaveMode = false;
 
 // -------------------- Pin Definitions --------------------
 const int RA0_PIN = D3;
@@ -159,6 +161,7 @@ public:
 };
 
 Knob volumeKnob(0, 8);      // Knob 3
+Knob octaveKnob(1, 7);      // Knob 2
 Knob tempoKnob(40, 240);    // Knob 0
 
 // -------------------- Timers & Display --------------------
@@ -327,13 +330,14 @@ void scanKeysIteration() {
       all_inputs[index] = result[col];
     }
   }
+  uint8_t moduleOctave = octaveKnob.getRotation();
   #ifdef MODULE_MODE_SENDER
     for (uint8_t i = 0; i < 12; i++) {
       bool currentPressed = !all_inputs[i];
       if (currentPressed != prevKeyPressed[i]) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        TX_Message[1] = MODULE_OCTAVE;
+        TX_Message[1] = moduleOctave;
         TX_Message[2] = i;
         xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
         #ifdef MODULE_MODE_RECEIVER
@@ -351,6 +355,7 @@ void scanKeysIteration() {
     }
   #endif
   volumeKnob.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  octaveKnob.update((all_inputs[15] << 1) | all_inputs[14], all_inputs[20]); // Knob 2
   tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   xSemaphoreTake(sysState.mutex, portMAX_DELAY);
@@ -359,8 +364,8 @@ void scanKeysIteration() {
 #endif
 }
 
-// -------------------- toggleMetronome() --------------------
-void toggleMetronome() {
+// -------------------- toggleMetronomeScreen() --------------------
+void toggleMetronomeScreen() {
   static bool lastButtonState = HIGH;
   bool currentButtonState = tempoKnob.getPressed();
   if (lastButtonState == HIGH && currentButtonState == LOW) {
@@ -370,6 +375,17 @@ void toggleMetronome() {
   lastButtonState = currentButtonState;
 }
 
+// -------------------- toggleOctaveScreen() --------------------
+void toggleOctaveScreen() {
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = octaveKnob.getPressed();
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    octaveMode.store(!octaveMode, std::memory_order_relaxed);
+  }
+  lastButtonState = currentButtonState;
+}
+
+// -------------------- Testing --------------------
 #if TEST_MODE == 2
 void testDisplayIteration() {
   char keyLabel[16] = "None";
@@ -604,7 +620,8 @@ void displayUpdateTask(void * pvParameters) {
   char keyLabel[16] = "None";
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    toggleMetronome();
+    toggleMetronomeScreen();
+    toggleOctaveScreen();
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
     if (metronomeMode.load(std::memory_order_relaxed)) {
@@ -613,6 +630,11 @@ void displayUpdateTask(void * pvParameters) {
       u8g2.drawStr(2, 32, "Tempo: ");
       u8g2.setCursor(50, 32);
       u8g2.print(bpm);
+    } else if (octaveMode.load(std::memory_order_relaxed)) {
+      uint32_t octave = octaveKnob.getRotation();
+      u8g2.drawStr(2, 10, "Octave: ");
+      u8g2.setCursor(70, 10);
+      u8g2.print(octave);
     } else {
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       if (sysState.RX_Message[0] == 'P') {
