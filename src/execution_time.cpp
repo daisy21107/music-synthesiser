@@ -3,7 +3,7 @@
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
 // Set the module's octave (0-8); this is used locally when sending.
-#define MODULE_OCTAVE 6
+#define MODULE_OCTAVE 4
 
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
@@ -91,19 +91,16 @@ const int HKOE_BIT = 6;
 volatile uint32_t currentStepSize = 0;
 
 // -------------------- ADSR Envelope Variables --------------------
-volatile float envelopeLevel = 0.0f;   // 0.0 to 1.0
-volatile float attackRate   = 0.0001f;   // Attack increment
-volatile float decayRate    = 0.001f;    // Decay decrement until sustain
-volatile float sustainLevel = 0.6f;      // Sustain level
-volatile float releaseRate  = 0.00005f;   // Release decrement
-volatile bool keyPressed  = false;
-volatile bool keyReleased = false;
-volatile int32_t debugVout = 0;
+const float attackRate   = 0.0001f;   // Attack increment
+const float decayRate    = 0.001f;    // Decay decrement until sustain
+const float sustainLevel = 0.6f;      // Sustain level
+const float releaseRate  = 0.00005f;   // Release decrement
+std::atomic<bool> keyPressed(false);
+std::atomic<bool> keyReleased(false);
 
 // -------------------- Metronome Variables --------------------
-volatile uint32_t metronomeInterval = 500; // Default 120 BPM (500ms per tick)
-volatile bool metronomeEnabled = false;
-volatile bool metronomeMode = false;
+volatile std::atomic<bool> metronomeEnabled = false;
+volatile std::atomic<bool> metronomeMode = false;
 
 // -------------------- Knob Class --------------------
 class Knob {
@@ -119,7 +116,7 @@ public:
       lowerLimit(minVal), upperLimit(maxVal), isPressed(false) {}
 
   void update(uint8_t currState) {
-    int32_t localRotation = rotation.load();
+    int32_t localRotation = rotation.load(std::memory_order_relaxed);
     if ((prevState == 0b00 && currState == 0b01) ||
         (prevState == 0b01 && currState == 0b11) ||
         (prevState == 0b11 && currState == 0b10) ||
@@ -140,21 +137,21 @@ public:
     }
     if (localRotation < lowerLimit) localRotation = lowerLimit;
     if (localRotation > upperLimit) localRotation = upperLimit;
-    rotation.store(localRotation);
+    rotation.store(localRotation, std::memory_order_relaxed);
     prevState = currState;
   }
   
   void update(uint8_t currState, bool pressed) {
     update(currState);
-    isPressed.store(pressed);
+    isPressed.store(pressed, std::memory_order_relaxed);
   }
   
   int32_t getRotation() const {
-    return rotation.load();
+    return rotation.load(std::memory_order_relaxed);
   }
   
   bool getPressed() const {
-    return isPressed.load();
+    return isPressed.load(std::memory_order_relaxed);
   }
 };
 
@@ -236,11 +233,11 @@ void scanKeysIteration() {
             else if (TX_Message[1] < 4)
               step >>= (4 - TX_Message[1]);
             __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-            keyPressed = true;
-            keyReleased = false;
+            keyPressed.store(true, std::memory_order_relaxed);
+            keyReleased.store(false, std::memory_order_relaxed);
           } else {
-            keyPressed = false;
-            keyReleased = true;
+            keyPressed.store(false, std::memory_order_relaxed);
+            keyReleased.store(true, std::memory_order_relaxed);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -289,11 +286,11 @@ void scanKeysIteration() {
             else if (TX_Message[1] < 4)
               step >>= (4 - TX_Message[1]);
             __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-            keyPressed = true;
-            keyReleased = false;
+            keyPressed.store(true, std::memory_order_relaxed);
+            keyReleased.store(false, std::memory_order_relaxed);
           } else {
-            keyPressed = false;
-            keyReleased = true;
+            keyPressed.store(false, std::memory_order_relaxed);
+            keyReleased.store(true, std::memory_order_relaxed);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -309,13 +306,13 @@ void scanKeysIteration() {
 #endif
 }
 
-// -------------------- checkKnobButton() --------------------
-void checkKnobButton() {
+// -------------------- toggleMetronome() --------------------
+void toggleMetronome() {
   static bool lastButtonState = HIGH;
   bool currentButtonState = tempoKnob.getPressed();
   if (lastButtonState == HIGH && currentButtonState == LOW) {
-    metronomeMode = !metronomeMode;
-    metronomeEnabled = metronomeMode;
+    metronomeMode.store(!metronomeMode, std::memory_order_relaxed);
+    metronomeEnabled.store(metronomeMode, std::memory_order_relaxed);
   }
   lastButtonState = currentButtonState;
 }
@@ -378,7 +375,7 @@ void testCANTXIteration() {
 // This function simulates one iteration of the metronome task—that is,
 // it reads the tempo knob, computes the metronomeInterval, and updates the timer.
 void testMetronomeIteration() {
-  if (metronomeMode) {  // Only if metronome mode is active
+  if (metronomeMode.load(std::memory_order_relaxed)) {  // Only if metronome mode is active
     uint32_t bpm = tempoKnob.getRotation();
     metronomeInterval = 60000 / bpm;
     metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
@@ -424,6 +421,7 @@ void decodeTask(void *pvParameters) {
         
         keyPressed = false;
         keyReleased = true;
+      //  __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
 
       // Store the received message (for debugging)
@@ -452,11 +450,12 @@ void CAN_TX_Task(void * pvParameters) {
 #ifdef MODULE_MODE_RECEIVER
 #if TEST_MODE == 0
 void sampleISR() {
+  static float envelopeLevel = 0.0f;   // 0.0 to 1.0
   static uint32_t phaseAcc = 0;
   uint32_t localCurrentStepSize;
   __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
   
-  if (keyPressed) {
+  if (keyPressed.load(std::memory_order_relaxed)) {
     if (envelopeLevel < 1.0f) {
       envelopeLevel += attackRate;
       if (envelopeLevel > 1.0f) envelopeLevel = 1.0f;
@@ -464,12 +463,12 @@ void sampleISR() {
       envelopeLevel -= decayRate;
       if (envelopeLevel < sustainLevel) envelopeLevel = sustainLevel;
     }
-  } else if (keyReleased) {
+  } else if (keyReleased.load(std::memory_order_relaxed)) {
     if (envelopeLevel > 0.0f) {
       envelopeLevel -= releaseRate;
       if (envelopeLevel < 0.0f) {
         envelopeLevel = 0.0f;
-        keyReleased = false;
+        keyReleased.store(false, std::memory_order_relaxed);
         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED); // Stop the sound AFTER the envelope finishes
       }
     }
@@ -483,7 +482,6 @@ void sampleISR() {
   int32_t rawWave = (phaseAcc >> 24) - 128;
   int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
   Vout = Vout >> (8 - knob3.getRotation());
-  debugVout = Vout;
 
   // Continue output until the envelope decays to zero
   if (envelopeLevel > 0.0f) {
@@ -502,7 +500,7 @@ void sampleISR() {
 // -------------------- Metronome ISR --------------------
 void metronomeISR() {
   static bool tickState = false;
-  if (metronomeEnabled) {
+  if (metronomeEnabled.load(std::memory_order_relaxed)) {
       analogWrite(OUTR_PIN, tickState ? 255 : 0); // Toggle speaker output
       tickState = !tickState;
   }
@@ -523,9 +521,10 @@ void scanKeysTask(void * pvParameters) {
 void metronomeTask(void *pvParameters) {
   const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+  uint32_t metronomeInterval = 500; // Default 120 BPM (500ms per tick)
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    if (metronomeMode) {
+    if (metronomeMode.load(std::memory_order_relaxed)) {
       uint32_t bpm = tempoKnob.getRotation();
       metronomeInterval = 60000 / bpm;
       metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
@@ -541,10 +540,10 @@ void displayUpdateTask(void * pvParameters) {
   char keyLabel[16] = "None";
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    checkKnobButton();
+    toggleMetronome();
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
-    if (metronomeMode) {
+    if (metronomeMode.load(std::memory_order_relaxed)) {
       uint32_t bpm = tempoKnob.getRotation();
       u8g2.drawStr(20, 16, "Metronome Mode");
       u8g2.drawStr(2, 32, "Tempo: ");
@@ -636,7 +635,7 @@ void setup() {
   sampleTimer.resume();
   
   // Set up the metronome timer.
-  metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
+  metronomeTimer.setOverflow(500000, MICROSEC_FORMAT);
   metronomeTimer.attachInterrupt(metronomeISR);
   metronomeTimer.resume();
   
@@ -697,8 +696,8 @@ void setup() {
     // New test mode for metronome task iteration.
     Serial.println("TEST MODE 6: Timing metronomeTask() iteration");
     // Ensure metronome mode is active (for testing, you might force it on):
-    metronomeMode = true;
-    metronomeEnabled = true;
+    metronomeMode.store(true, std::memory_order_relaxed);
+    metronomeEnabled.store(true, std::memory_order_relaxed);
     // Optionally, set a fixed tempo.
     // For example, force tempoKnob rotation to 120 BPM:
     // (Assuming getRotation() returns an integer BPM; adjust as needed.)
