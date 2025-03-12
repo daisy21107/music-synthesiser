@@ -2,6 +2,8 @@
 #define MODULE_MODE_SENDER       // Enable sending: local key changes will be transmitted
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
+#define MAX_SOUNDS 12  // Maximum simultaneous sounds
+
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
 // 1 = test scanKeysIteration() execution time        : ~3251 µs for 32 iterations (~101.6 µs per iteration)
@@ -35,7 +37,7 @@
 QueueHandle_t msgInQ  = NULL;   // For incoming CAN messages
 QueueHandle_t msgOutQ = NULL;   // For outgoing CAN messages
 SemaphoreHandle_t CAN_TX_Semaphore = NULL;  // Counting semaphore for TX mailboxes
-SemaphoreHandle_t voicesMutex;
+SemaphoreHandle_t soundsMutex;
 
 // -------------------- System State --------------------
 struct {
@@ -66,8 +68,6 @@ const uint32_t stepSizes[12] = {
   96418755  // B4
 };
 
-volatile std::atomic<bool> octaveMode = false;
-
 // -------------------- Pin Definitions --------------------
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
@@ -94,9 +94,7 @@ const float sustainLevel = 0.6f;      // Sustain level
 const float releaseRate  = 0.00005f;   // Release decrement
 
 // -------------------- Polyphony Data Structures --------------------
-#define MAX_VOICES 12  // Maximum simultaneous voices
-
-struct Voice {
+struct Sound {
   bool active;
   uint8_t note;
   uint8_t octave;
@@ -107,12 +105,15 @@ struct Voice {
   bool keyReleased;
 };
 
-// Global array of voices – one per simultaneous note
-Voice voices[MAX_VOICES] = {0};
+// Global array of sounds – one per simultaneous note
+Sound sounds[MAX_SOUNDS] = {0};
 
 // -------------------- Metronome Variables --------------------
 volatile std::atomic<bool> metronomeEnabled = false;
 volatile std::atomic<bool> metronomeMode = false;
+
+// -------------------- Octave Variables --------------------
+volatile std::atomic<bool> octaveMode = false;
 
 // -------------------- Knob Class --------------------
 class Knob {
@@ -195,71 +196,71 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(REN_PIN, HIGH);
 }
 
-// -------------------- Helper Functions for Note Allocation --------------------
-// Called on key press to start a new voice.
-void startVoice(uint8_t note, uint8_t octave) {
-  if (xSemaphoreTake(voicesMutex, portMAX_DELAY) == pdTRUE) {
+// -------------------- Helper Functions for Sound Allocation --------------------
+// Called on key press to start a new sound
+void startSound(uint8_t note, uint8_t octave) {
+  if (xSemaphoreTake(soundsMutex, portMAX_DELAY) == pdTRUE) {
     // Check if the same note is already active
-    for (int i = 0; i < MAX_VOICES; i++) {
-      if (voices[i].active && voices[i].note == note && voices[i].octave == octave) {
-        // Re-trigger the same voice immediately
-        voices[i].keyPressed = true;
-        voices[i].keyReleased = false;
-        voices[i].envelopeLevel = 0.0f;
-        voices[i].phaseAcc = 0;
-        xSemaphoreGive(voicesMutex);
+    for (int i = 0; i < MAX_SOUNDS; i++) {
+      if (sounds[i].active && sounds[i].note == note && sounds[i].octave == octave) {
+        // Re-trigger the same sound immediately
+        sounds[i].keyPressed = true;
+        sounds[i].keyReleased = false;
+        sounds[i].envelopeLevel = 0.0f;
+        sounds[i].phaseAcc = 0;
+        xSemaphoreGive(soundsMutex);
         return;
       }
     }
-    // No active voice for this note found: allocate a new voice/find free voice slot
-    for (int i = 0; i < MAX_VOICES; i++) {
-      if (!voices[i].active) {
-        voices[i].active = true;
-        voices[i].note = note;
-        voices[i].octave = octave;
-        voices[i].stepSize = stepSizes[note];
+    // No active sound for this note found: allocate a new sound/find free sound slot
+    for (int i = 0; i < MAX_SOUNDS; i++) {
+      if (!sounds[i].active) {
+        sounds[i].active = true;
+        sounds[i].note = note;
+        sounds[i].octave = octave;
+        sounds[i].stepSize = stepSizes[note];
         if (octave > 4)
-          voices[i].stepSize <<= (octave - 4);
+          sounds[i].stepSize <<= (octave - 4);
         else if (octave < 4)
-          voices[i].stepSize >>= (4 - octave);
-        voices[i].phaseAcc = 0;
-        voices[i].envelopeLevel = 0.0f; // start at 0; will ramp up in ISR
-        voices[i].keyPressed = true;
-        voices[i].keyReleased = false;
-        xSemaphoreGive(voicesMutex);
+          sounds[i].stepSize >>= (4 - octave);
+        sounds[i].phaseAcc = 0;
+        sounds[i].envelopeLevel = 0.0f;
+        sounds[i].keyPressed = true;
+        sounds[i].keyReleased = false;
+        xSemaphoreGive(soundsMutex);
         return;
       }
     }
-    // If no free voice is found, steal the first voice (simple voice stealing)
+    // If no free sound is found, steal the first sound
     int i = 0;
-    voices[i].active = true;
-    voices[i].note = note;
-    voices[i].octave = octave;
-    voices[i].stepSize = stepSizes[note];
+    sounds[i].active = true;
+    sounds[i].note = note;
+    sounds[i].octave = octave;
+    sounds[i].stepSize = stepSizes[note];
     if (octave > 4)
-      voices[i].stepSize <<= (octave - 4);
+      sounds[i].stepSize <<= (octave - 4);
     else if (octave < 4)
-      voices[i].stepSize >>= (4 - octave);
-    voices[i].phaseAcc = 0;
-    voices[i].envelopeLevel = 0.0f;
-    voices[i].keyPressed = true;
-    voices[i].keyReleased = false;
-    xSemaphoreGive(voicesMutex);
+      sounds[i].stepSize >>= (4 - octave);
+    sounds[i].phaseAcc = 0;
+    sounds[i].envelopeLevel = 0.0f;
+    sounds[i].keyPressed = true;
+    sounds[i].keyReleased = false;
+    xSemaphoreGive(soundsMutex);
   }
 }
   
-// Called on key release to mark the voice as released.
-void releaseVoice(uint8_t note, uint8_t octave) {
-  if (xSemaphoreTake(voicesMutex, portMAX_DELAY) == pdTRUE) {
-    // Search for a voice that matches the note and octave and is still active.
-    for (int i = 0; i < MAX_VOICES; i++) {
-      if (voices[i].active && voices[i].note == note && voices[i].octave == octave && voices[i].keyPressed) {
-        voices[i].keyPressed = false;
-        voices[i].keyReleased = true;
+// Called on key release to mark the sound as released
+void releaseSound(uint8_t note, uint8_t octave) {
+  if (xSemaphoreTake(soundsMutex, portMAX_DELAY) == pdTRUE) {
+    // Search for a sound that matches the note and octave and is still active.
+    for (int i = 0; i < MAX_SOUNDS; i++) {
+      if (sounds[i].active && sounds[i].note == note && sounds[i].octave == octave && sounds[i].keyPressed) {
+        sounds[i].keyPressed = false;
+        sounds[i].keyReleased = true;
         break;
       }
     }
-    xSemaphoreGive(voicesMutex);
+    xSemaphoreGive(soundsMutex);
   }
 }
 
@@ -297,9 +298,9 @@ void scanKeysIteration() {
             xSemaphoreGive(sysState.mutex);
           }
           if (TX_Message[0] == 'P') {
-            startVoice(TX_Message[2], TX_Message[1]);
+            startSound(TX_Message[2], TX_Message[1]);
           } else {
-            releaseVoice(TX_Message[2], TX_Message[1]);
+            releaseSound(TX_Message[2], TX_Message[1]);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -342,9 +343,9 @@ void scanKeysIteration() {
           memcpy(sysState.RX_Message, TX_Message, 8);
           xSemaphoreGive(sysState.mutex);
           if (TX_Message[0] == 'P') { // Key pressed
-            startVoice(TX_Message[2], TX_Message[1]);
+            startSound(TX_Message[2], TX_Message[1]);
           } else { // Key released
-            releaseVoice(TX_Message[2], TX_Message[1]);
+            releaseSound(TX_Message[2], TX_Message[1]);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -409,9 +410,9 @@ void testDecodeIteration() {
   uint8_t note = testMsg[2];
   uint32_t step = stepSizes[note];
   if (testMsg[0] == 'P') {
-    startVoice(note, octave);
+    startSound(note, octave);
   } else if (testMsg[0] == 'R') {
-    releaseVoice(note, octave);
+    releaseSound(note, octave);
   }
   memcpy(sysState.RX_Message, testMsg, 8);
 }
@@ -465,9 +466,9 @@ void decodeTask(void *pvParameters) {
   while (1) {
     if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
       if (localMsg[0] == 'P') {
-        startVoice(localMsg[2], localMsg[1]);
+        startSound(localMsg[2], localMsg[1]);
       } else if (localMsg[0] == 'R') {  // Key Released
-        releaseVoice(localMsg[2], localMsg[1]);
+        releaseSound(localMsg[2], localMsg[1]);
       }
 
       // Store the received message (for debugging)
@@ -496,44 +497,44 @@ void CAN_TX_Task(void * pvParameters) {
 #ifdef MODULE_MODE_RECEIVER
 #if TEST_MODE == 0
 void sampleISR() {
-  int32_t Vout_total = 0; // Sum of all voices
+  int32_t Vout_total = 0; // Sum of all sounds
 
-  // Iterate over all voices
-  for (int i = 0; i < MAX_VOICES; i++) {
+  // Iterate over all sounds
+  for (int i = 0; i < MAX_SOUNDS; i++) {
 
-    // Quickly copy the shared Voice into a local variable in a critical section.
+    // Quickly copy the shared Sound into a local variable in a critical section.
     UBaseType_t uxSaved = portSET_INTERRUPT_MASK_FROM_ISR();
-    Voice localVoice = voices[i];
+    Sound localSound = sounds[i];
     portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved);
 
-    if (!localVoice.active)
+    if (!localSound.active)
       continue;
 
-    // Update the envelope for this voice.
-    if (localVoice.keyPressed) {
+    // Update the envelope for this sound
+    if (localSound.keyPressed) {
       // Attack phase: ramp up envelope until full amplitude
-      if (localVoice.envelopeLevel < 1.0f) {
-        localVoice.envelopeLevel += attackRate;
-        if (localVoice.envelopeLevel > 1.0f)
-          localVoice.envelopeLevel = 1.0f;
+      if (localSound.envelopeLevel < 1.0f) {
+        localSound.envelopeLevel += attackRate;
+        if (localSound.envelopeLevel > 1.0f)
+          localSound.envelopeLevel = 1.0f;
       }
       // Decay phase: if envelope overshoots sustain, decay down to sustain level
-      else if (localVoice.envelopeLevel > sustainLevel) {
-        localVoice.envelopeLevel -= decayRate;
-        if (localVoice.envelopeLevel < sustainLevel)
-        localVoice.envelopeLevel = sustainLevel;
+      else if (localSound.envelopeLevel > sustainLevel) {
+        localSound.envelopeLevel -= decayRate;
+        if (localSound.envelopeLevel < sustainLevel)
+        localSound.envelopeLevel = sustainLevel;
       }
     }
-    else if (localVoice.keyReleased) {
+    else if (localSound.keyReleased) {
       // Release phase: decay envelope to zero
-      if (localVoice.envelopeLevel > 0.0f) {
-        localVoice.envelopeLevel -= releaseRate;
-        if (localVoice.envelopeLevel <= 0.0f) {
-          localVoice.envelopeLevel = 0.0f;
+      if (localSound.envelopeLevel > 0.0f) {
+        localSound.envelopeLevel -= releaseRate;
+        if (localSound.envelopeLevel <= 0.0f) {
+          localSound.envelopeLevel = 0.0f;
 
-          // Mark voice inactive in a short critical section.
+          // Mark sound inactive
           UBaseType_t uxSaved2 = portSET_INTERRUPT_MASK_FROM_ISR();
-          voices[i].active = false;   // Voice finished
+          sounds[i].active = false;   // Sound finished
           portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved2);
           continue;
         }
@@ -541,18 +542,18 @@ void sampleISR() {
     }
 
     // Phase accumulation should continue until the envelope reaches zero
-    if (localVoice.envelopeLevel > 0.0f)
-      localVoice.phaseAcc += localVoice.stepSize;
+    if (localSound.envelopeLevel > 0.0f)
+      localSound.phaseAcc += localSound.stepSize;
 
-    int32_t rawWave = (localVoice.phaseAcc >> 24) - 128;
-    int32_t voiceOutput = static_cast<int32_t>(rawWave * localVoice.envelopeLevel);
+    int32_t rawWave = (localSound.phaseAcc >> 24) - 128;
+    int32_t soundOutput = static_cast<int32_t>(rawWave * localSound.envelopeLevel);
 
-    Vout_total += voiceOutput;
+    Vout_total += soundOutput;
 
     // Write back the updated phase accumulator and envelopeLevel.
     UBaseType_t uxSaved3 = portSET_INTERRUPT_MASK_FROM_ISR();
-    voices[i].phaseAcc = localVoice.phaseAcc;
-    voices[i].envelopeLevel = localVoice.envelopeLevel;
+    sounds[i].phaseAcc = localSound.phaseAcc;
+    sounds[i].envelopeLevel = localSound.envelopeLevel;
     portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved3);
   }
 
@@ -698,9 +699,9 @@ void setup() {
   
   // Create RTOS objects.
   sysState.mutex = xSemaphoreCreateMutex();
-  voicesMutex = xSemaphoreCreateMutex();
-  if (voicesMutex == NULL) {
-    Serial.println("Error: Could not create voicesMutex");
+  soundsMutex = xSemaphoreCreateMutex();
+  if (soundsMutex == NULL) {
+    Serial.println("Error: Could not create soundsMutex");
   }
 
   msgInQ  = xQueueCreate(36, 8);
