@@ -91,12 +91,29 @@ const int HKOE_BIT = 6;
 volatile uint32_t currentStepSize = 0;
 
 // -------------------- ADSR Envelope Variables --------------------
-const float attackRate   = 0.0001f;   // Attack increment
+const float attackRate   = 0.001f;   // Attack increment
 const float decayRate    = 0.001f;    // Decay decrement until sustain
 const float sustainLevel = 0.6f;      // Sustain level
 const float releaseRate  = 0.00005f;   // Release decrement
-std::atomic<bool> keyPressed(false);
-std::atomic<bool> keyReleased(false);
+// std::atomic<bool> keyPressed(false);
+// std::atomic<bool> keyReleased(false);
+
+// -------------------- Polyphony Data Structures --------------------
+#define MAX_VOICES 12  // Maximum simultaneous voices
+
+struct Voice {
+  bool active;
+  uint8_t note;
+  uint8_t octave;
+  uint32_t stepSize;
+  uint32_t phaseAcc;
+  float envelopeLevel;
+  bool keyPressed;
+  bool keyReleased;
+};
+
+// Global array of voices – one per simultaneous note
+Voice voices[MAX_VOICES] = {0};
 
 // -------------------- Metronome Variables --------------------
 volatile std::atomic<bool> metronomeEnabled = false;
@@ -180,6 +197,66 @@ void setRow(uint8_t rowIdx) {
   digitalWrite(RA1_PIN, rowIdx & 0x02);
   digitalWrite(RA2_PIN, rowIdx & 0x04);
   digitalWrite(REN_PIN, HIGH);
+}
+
+// -------------------- Helper Functions for Note Allocation --------------------
+// Called on key press to start a new voice.
+void startVoice(uint8_t note, uint8_t octave) {
+  // Check if the same note is already active
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (voices[i].active && voices[i].note == note && voices[i].octave == octave) {
+      // Re-trigger the same voice immediately
+      voices[i].keyPressed = true;
+      voices[i].keyReleased = false;
+      voices[i].envelopeLevel = 0.0f;
+      voices[i].phaseAcc = 0;
+      return;
+    }
+  }
+  // No active voice for this note found: allocate a new voice/find free voice slot
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active) {
+      voices[i].active = true;
+      voices[i].note = note;
+      voices[i].octave = octave;
+      voices[i].stepSize = stepSizes[note];
+      if (octave > 4)
+        voices[i].stepSize <<= (octave - 4);
+      else if (octave < 4)
+        voices[i].stepSize >>= (4 - octave);
+      voices[i].phaseAcc = 0;
+      voices[i].envelopeLevel = 0.0f; // start at 0; will ramp up in ISR
+      voices[i].keyPressed = true;
+      voices[i].keyReleased = false;
+      return;
+    }
+  }
+  // If no free voice is found, steal the first voice (simple voice stealing)
+  int i = 0;
+  voices[i].active = true;
+  voices[i].note = note;
+  voices[i].octave = octave;
+  voices[i].stepSize = stepSizes[note];
+  if (octave > 4)
+    voices[i].stepSize <<= (octave - 4);
+  else if (octave < 4)
+    voices[i].stepSize >>= (4 - octave);
+  voices[i].phaseAcc = 0;
+  voices[i].envelopeLevel = 0.0f;
+  voices[i].keyPressed = true;
+  voices[i].keyReleased = false;
+}
+  
+// Called on key release to mark the voice as released.
+void releaseVoice(uint8_t note, uint8_t octave) {
+  // Search for a voice that matches the note and octave and is still active.
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (voices[i].active && voices[i].note == note && voices[i].octave == octave && voices[i].keyPressed) {
+      voices[i].keyPressed = false;
+      voices[i].keyReleased = true;
+      return;
+    }
+  }
 }
 
 // -------------------- scanKeysIteration() --------------------
@@ -268,19 +345,21 @@ void scanKeysIteration() {
           xSemaphoreTake(sysState.mutex, portMAX_DELAY);
           memcpy(sysState.RX_Message, TX_Message, 8);
           xSemaphoreGive(sysState.mutex);
-          if (TX_Message[0] == 'P') {
-            uint8_t note = TX_Message[2];
-            uint32_t step = stepSizes[note];
-            if (TX_Message[1] > 4)
-              step <<= (TX_Message[1] - 4);
-            else if (TX_Message[1] < 4)
-              step >>= (4 - TX_Message[1]);
-            __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-            keyPressed.store(true, std::memory_order_relaxed);
-            keyReleased.store(false, std::memory_order_relaxed);
-          } else {
-            keyPressed.store(false, std::memory_order_relaxed);
-            keyReleased.store(true, std::memory_order_relaxed);
+          if (TX_Message[0] == 'P') { // Key pressed
+            startVoice(TX_Message[2], TX_Message[1]);
+            // uint8_t note = TX_Message[2];
+            // uint32_t step = stepSizes[note];
+            // if (TX_Message[1] > 4)
+            //   step <<= (TX_Message[1] - 4);
+            // else if (TX_Message[1] < 4)
+            //   step >>= (4 - TX_Message[1]);
+            // __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+            // keyPressed.store(true, std::memory_order_relaxed);
+            // keyReleased.store(false, std::memory_order_relaxed);
+          } else { // Key released
+            releaseVoice(TX_Message[2], TX_Message[1]);
+            // keyPressed.store(false, std::memory_order_relaxed);
+            // keyReleased.store(true, std::memory_order_relaxed);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -395,22 +474,23 @@ void decodeTask(void *pvParameters) {
   while (1) {
     if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
       if (localMsg[0] == 'P') {
-        uint8_t octave = localMsg[1];
-        uint8_t note = localMsg[2];
-        uint32_t step = stepSizes[note];
-        // Adjust step size based on octave
-        if (octave > 4)
-          step <<= (octave - 4);
-        else if (octave < 4)
-          step >>= (4 - octave);
-        __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-        keyPressed.store(true, std::memory_order_relaxed);
-        keyReleased.store(false, std::memory_order_relaxed);
+        startVoice(localMsg[2], localMsg[1]);
+        // uint8_t octave = localMsg[1];
+        // uint8_t note = localMsg[2];
+        // uint32_t step = stepSizes[note];
+        // // Adjust step size based on octave
+        // if (octave > 4)
+        //   step <<= (octave - 4);
+        // else if (octave < 4)
+        //   step >>= (4 - octave);
+        // __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+        // keyPressed.store(true, std::memory_order_relaxed);
+        // keyReleased.store(false, std::memory_order_relaxed);
 
       } else if (localMsg[0] == 'R') {  // Key Released
-        
-        keyPressed.store(false, std::memory_order_relaxed);
-        keyReleased.store(true, std::memory_order_relaxed);
+        releaseVoice(localMsg[2], localMsg[1]);
+        // keyPressed.store(false, std::memory_order_relaxed);
+        // keyReleased.store(true, std::memory_order_relaxed);
       }
 
       // Store the received message (for debugging)
@@ -439,45 +519,101 @@ void CAN_TX_Task(void * pvParameters) {
 #ifdef MODULE_MODE_RECEIVER
 #if TEST_MODE == 0
 void sampleISR() {
-  static float envelopeLevel = 0.0f;   // 0.0 to 1.0
-  static uint32_t phaseAcc = 0;
-  uint32_t localCurrentStepSize;
-  __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
-  
-  if (keyPressed.load(std::memory_order_relaxed)) {
-    if (envelopeLevel < 1.0f) {
-      envelopeLevel += attackRate;
-      if (envelopeLevel > 1.0f) envelopeLevel = 1.0f;
-    } else if (envelopeLevel > sustainLevel) {
-      envelopeLevel -= decayRate;
-      if (envelopeLevel < sustainLevel) envelopeLevel = sustainLevel;
-    }
-  } else if (keyReleased.load(std::memory_order_relaxed)) {
-    if (envelopeLevel > 0.0f) {
-      envelopeLevel -= releaseRate;
-      if (envelopeLevel < 0.0f) {
-        envelopeLevel = 0.0f;
-        keyReleased.store(false, std::memory_order_relaxed);
-        __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED); // Stop the sound AFTER the envelope finishes
+  int32_t Vout_total = 0; // Sum of all voices
+
+  // Iterate over all voices
+  for (int i = 0; i < MAX_VOICES; i++) {
+    if (!voices[i].active)
+      continue;
+    Voice &v = voices[i];
+
+    // Update the envelope for this voice.
+    if (v.keyPressed) {
+      // Attack phase: ramp up envelope until full amplitude
+      if (v.envelopeLevel < 1.0f) {
+        v.envelopeLevel += attackRate;
+        if (v.envelopeLevel > 1.0f)
+          v.envelopeLevel = 1.0f;
+      }
+      // Decay phase: if envelope overshoots sustain, decay down to sustain level
+      else if (v.envelopeLevel > sustainLevel) {
+        v.envelopeLevel -= decayRate;
+        if (v.envelopeLevel < sustainLevel)
+          v.envelopeLevel = sustainLevel;
       }
     }
+    else if (v.keyReleased) {
+      // Release phase: decay envelope to zero
+      if (v.envelopeLevel > 0.0f) {
+        v.envelopeLevel -= releaseRate;
+        if (v.envelopeLevel <= 0.0f) {
+          v.envelopeLevel = 0.0f;
+          v.active = false;  // Voice finished
+          continue;
+        }
+      }
+    }
+
+    // Phase accumulation should continue until the envelope reaches zero
+    if (v.envelopeLevel > 0.0f)
+      v.phaseAcc += v.stepSize;
+
+    int32_t rawWave = (v.phaseAcc >> 24) - 128;
+    int32_t voiceOutput = static_cast<int32_t>(rawWave * v.envelopeLevel);
+
+    Vout_total += voiceOutput;
   }
 
-  // Phase accumulation should continue until the envelope reaches zero
-  if (envelopeLevel > 0.0f) {
-    phaseAcc += localCurrentStepSize;
-  }
+  // Volume control
+  Vout_total = Vout_total >> (8 - knob3.getRotation());
+
+  // Clip Vout
+  if (Vout_total > 127)
+    Vout_total = 127;
+  else if (Vout_total < -128)
+    Vout_total = -128;
+
+  analogWrite(OUTR_PIN, Vout_total + 128);
+
+//   static float envelopeLevel = 0.0f;   // 0.0 to 1.0
+//   static uint32_t phaseAcc = 0;
+//   uint32_t localCurrentStepSize;
+//   __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
   
-  int32_t rawWave = (phaseAcc >> 24) - 128;
-  int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
-  Vout = Vout >> (8 - knob3.getRotation());
+//   if (keyPressed.load(std::memory_order_relaxed)) {
+//     if (envelopeLevel < 1.0f) {
+//       envelopeLevel += attackRate;
+//       if (envelopeLevel > 1.0f) envelopeLevel = 1.0f;
+//     } else if (envelopeLevel > sustainLevel) {
+//       envelopeLevel -= decayRate;
+//       if (envelopeLevel < sustainLevel) envelopeLevel = sustainLevel;
+//     }
+//   } else if (keyReleased.load(std::memory_order_relaxed)) {
+//     if (envelopeLevel > 0.0f) {
+//       envelopeLevel -= releaseRate;
+//       if (envelopeLevel < 0.0f) {
+//         envelopeLevel = 0.0f;
+//         keyReleased.store(false, std::memory_order_relaxed);
+//         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED); // Stop the sound AFTER the envelope finishes
+//       }
+//     }
+//   }
 
-  // Continue output until the envelope decays to zero
-  if (envelopeLevel > 0.0f) {
-    analogWrite(OUTR_PIN, Vout + 128); 
-  } else {
-    analogWrite(OUTR_PIN, 128);  // Default silence value
-}
+//   // Phase accumulation should continue until the envelope reaches zero
+//   if (envelopeLevel > 0.0f) {
+//     phaseAcc += localCurrentStepSize;
+//   }
+  
+//   int32_t rawWave = (phaseAcc >> 24) - 128;
+//   int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
+//   Vout = Vout >> (8 - knob3.getRotation());
+
+//   // Continue output until the envelope decays to zero
+//   if (envelopeLevel > 0.0f) {
+//     analogWrite(OUTR_PIN, Vout + 128); 
+//   } else {
+//     analogWrite(OUTR_PIN, 128);  // Default silence value
+//   }
 }
 #else
 void sampleISR() {
