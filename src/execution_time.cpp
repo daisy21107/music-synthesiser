@@ -414,14 +414,13 @@ void decodeTask(void *pvParameters) {
         else if (octave < 4)
           step >>= (4 - octave);
         __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-        keyPressed = true;
-        keyReleased = false;
+        keyPressed.store(true, std::memory_order_relaxed);
+        keyReleased.store(false, std::memory_order_relaxed);
 
       } else if (localMsg[0] == 'R') {  // Key Released
         
-        keyPressed = false;
-        keyReleased = true;
-      //  __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+        keyPressed.store(false, std::memory_order_relaxed);
+        keyReleased.store(true, std::memory_order_relaxed);
       }
 
       // Store the received message (for debugging)
