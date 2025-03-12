@@ -115,35 +115,25 @@ public:
     : rotation(0), prevState(0b00), lastDirection(0),
       lowerLimit(minVal), upperLimit(maxVal), isPressed(false) {}
 
-  void update(uint8_t currState) {
+  void update(uint8_t currState, bool pressed) {
     int32_t localRotation = rotation.load(std::memory_order_relaxed);
     if ((prevState == 0b00 && currState == 0b01) ||
-        (prevState == 0b01 && currState == 0b11) ||
-        (prevState == 0b11 && currState == 0b10) ||
-        (prevState == 0b10 && currState == 0b00)) {
-      localRotation++;
-      lastDirection = 1;
-    } else if ((prevState == 0b00 && currState == 0b10) ||
-               (prevState == 0b10 && currState == 0b11) ||
-               (prevState == 0b11 && currState == 0b01) ||
-               (prevState == 0b01 && currState == 0b00)) {
-      localRotation--;
-      lastDirection = -1;
+        (prevState == 0b11 && currState == 0b10)) { // Clockwise
+        localRotation++;
+        lastDirection = 1;
+    } else if ((prevState == 0b10 && currState == 0b11) ||
+               (prevState == 0b01 && currState == 0b00)) { // Anticlockwise
+        localRotation--;
+        lastDirection = -1;
     } else if ((prevState == 0b00 && currState == 0b11) ||
-               (prevState == 0b01 && currState == 0b10) ||
-               (prevState == 0b10 && currState == 0b01) ||
-               (prevState == 0b11 && currState == 0b00)) {
-      localRotation += lastDirection;
+               (prevState == 0b11 && currState == 0b00)) { // Impossible/illegal transitions
+        localRotation += lastDirection;
     }
     if (localRotation < lowerLimit) localRotation = lowerLimit;
     if (localRotation > upperLimit) localRotation = upperLimit;
     rotation.store(localRotation, std::memory_order_relaxed);
-    prevState = currState;
-  }
-  
-  void update(uint8_t currState, bool pressed) {
-    update(currState);
     isPressed.store(pressed, std::memory_order_relaxed);
+    prevState = currState;
   }
   
   int32_t getRotation() const {
@@ -245,8 +235,8 @@ void scanKeysIteration() {
     }
   #endif
   // Update rotary knobs as normal.
-  knob3.update((all_inputs[13] << 1) | all_inputs[12]);
-  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]);
+  knob3.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   // Update shared inputs with a 1-tick timeout.
   xSemaphoreTake(sysState.mutex, 1);
@@ -297,8 +287,8 @@ void scanKeysIteration() {
       }
     }
   #endif
-  knob3.update((all_inputs[13] << 1) | all_inputs[12]);
-  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]);
+  knob3.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   xSemaphoreTake(sysState.mutex, portMAX_DELAY);
   sysState.inputs = all_inputs;
