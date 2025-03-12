@@ -3,7 +3,7 @@
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
 // Set the module's octave (0-8); this is used locally when sending.
-#define MODULE_OCTAVE 5
+#define MODULE_OCTAVE 6
 
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
@@ -424,7 +424,6 @@ void decodeTask(void *pvParameters) {
         
         keyPressed = false;
         keyReleased = true;
-      //  __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
 
       // Store the received message (for debugging)
