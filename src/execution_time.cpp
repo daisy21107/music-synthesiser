@@ -10,13 +10,13 @@
 
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
-// 1 = test scanKeysIteration() execution time        : ~1468 µs for 32 iterations (~46 µs per iteration)
+// 1 = test scanKeysIteration() execution time        : ~3251 µs for 32 iterations (~101.6 µs per iteration)
 // 2 = test display update execution time             : ~1,666,056 µs for 32 iterations (~52 ms per iteration)
 // 3 = test decodeTask() processing iteration         : ~129 µs for 32 iterations (~4 µs per iteration)
 // 4 = test CAN_TX_Task() processing iteration        : ~74 µs for 32 iterations (~2.3 µs per iteration)
 // 5 = test sampleISR() execution time                : ~290 µs for 32 iterations (~9 µs per iteration)
 #ifndef TEST_MODE
-  #define TEST_MODE 0
+  #define TEST_MODE 5
 #endif
 
 #if TEST_MODE != 0
@@ -41,14 +41,14 @@ QueueHandle_t msgInQ  = NULL;   // For incoming CAN messages
 QueueHandle_t msgOutQ = NULL;   // For outgoing CAN messages
 SemaphoreHandle_t CAN_TX_Semaphore = NULL;  // Counting semaphore for TX mailboxes
 
-// We store the latest received message in sysState, protected by sysState.mutex
+// -------------------- System State --------------------
 struct {
   std::bitset<32> inputs;
   SemaphoreHandle_t mutex;
-  uint8_t RX_Message[8];  // Buffer for the latest incoming CAN frame
+  uint8_t RX_Message[8];  // Latest incoming CAN frame
 } sysState;
 
-// Instead of a fixed octave noteNames array, separate pitch classes.
+// -------------------- Note Names and Step Sizes --------------------
 const char* pitchClasses[12] = { 
   "C", "C#", "D", "D#", "E", "F", 
   "F#", "G", "G#", "A", "A#", "B" 
@@ -70,7 +70,7 @@ const uint32_t stepSizes[12] = {
   96418755  // B4
 };
 
-// -------------------- Pin definitions --------------------
+// -------------------- Pin Definitions --------------------
 const int RA0_PIN = D3;
 const int RA1_PIN = D6;
 const int RA2_PIN = D12;
@@ -89,8 +89,23 @@ const int DRST_BIT = 4;
 const int HKOW_BIT = 5;
 const int HKOE_BIT = 6;
 
-// -------------------- Global variable for audio generation step size --------------------
+// -------------------- Global Variable for Audio Generation --------------------
 volatile uint32_t currentStepSize = 0;
+
+// -------------------- ADSR Envelope Variables --------------------
+volatile float envelopeLevel = 0.0f;   // 0.0 to 1.0
+volatile float attackRate   = 0.0001f;   // Attack increment
+volatile float decayRate    = 0.001f;    // Decay decrement until sustain
+volatile float sustainLevel = 0.6f;      // Sustain level
+volatile float releaseRate  = 0.00005f;   // Release decrement
+volatile bool keyPressed  = false;
+volatile bool keyReleased = false;
+volatile int32_t debugVout = 0;
+
+// -------------------- Metronome Variables --------------------
+volatile uint32_t metronomeInterval = 500; // Default 120 BPM (500ms per tick)
+volatile bool metronomeEnabled = false;
+volatile bool metronomeMode = false;
 
 // -------------------- Knob Class --------------------
 class Knob {
@@ -99,9 +114,11 @@ private:
   uint8_t prevState;
   int8_t lastDirection;
   int32_t lowerLimit, upperLimit;
+  std::atomic<bool> isPressed;
 public:
   Knob(int32_t minVal = 0, int32_t maxVal = 8)
-    : rotation(0), prevState(0b00), lastDirection(0), lowerLimit(minVal), upperLimit(maxVal) {}
+    : rotation(0), prevState(0b00), lastDirection(0),
+      lowerLimit(minVal), upperLimit(maxVal), isPressed(false) {}
 
   void update(uint8_t currState) {
     int32_t localRotation = rotation.load();
@@ -129,20 +146,26 @@ public:
     prevState = currState;
   }
   
-  void setLimits(int32_t minVal, int32_t maxVal) {
-    lowerLimit = minVal;
-    upperLimit = maxVal;
+  void update(uint8_t currState, bool pressed) {
+    update(currState);
+    isPressed.store(pressed);
   }
   
   int32_t getRotation() const {
     return rotation.load();
   }
+  
+  bool getPressed() const {
+    return isPressed.load();
+  }
 };
 
 Knob knob3(0, 8);
+Knob tempoKnob(40, 240);
 
-// -------------------- Timer & Display --------------------
+// -------------------- Timers & Display --------------------
 HardwareTimer sampleTimer(TIM1);
+HardwareTimer metronomeTimer(TIM2);
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
 // -------------------- Helper Functions for Key Matrix --------------------
@@ -175,35 +198,16 @@ void setRow(uint8_t rowIdx) {
 }
 
 // -------------------- scanKeysIteration() --------------------
-// When TEST_MODE==1, use the test branch to simulate worst-case for key scanning.
-// Otherwise, run the normal key scanning routine.
+// In TEST_MODE==1, simulate key scanning without blocking.
 void scanKeysIteration() {
 #if TEST_MODE == 1
-  // Test branch for scanKeysIteration: simulate worst-case for each key.
-  for (uint8_t i = 0; i < 12; i++) {
-    uint8_t TX_Message[8] = { 'P', MODULE_OCTAVE, i, 0, 0, 0, 0, 0 };
-    // Update state directly (bypassing queue operations to avoid blocking)
-    #ifdef MODULE_MODE_RECEIVER
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-      memcpy(sysState.RX_Message, TX_Message, 8);
-      xSemaphoreGive(sysState.mutex);
-      uint32_t step = stepSizes[i];
-      if (MODULE_OCTAVE > 4)
-        step <<= (MODULE_OCTAVE - 4);
-      else if (MODULE_OCTAVE < 4)
-        step >>= (4 - MODULE_OCTAVE);
-      __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-    #endif
-  }
-  // Simulate a fixed knob update.
-  knob3.update(0b00);
-#else
-  // Normal scanKeysIteration() code:
+  // Test branch: run the full key scan routine to measure worst-case time.
   static bool prevKeyPressed[12] = { true, true, true, true, true, true, true, true, true, true, true, true };
   std::bitset<32> all_inputs;
-  for (uint8_t row = 0; row < 4; row++) {
+  // Scan 8 rows (as in normal operation) to capture extra controls.
+  for (uint8_t row = 0; row < 8; row++) {
     setRow(row);
-    delayMicroseconds(3);
+    delayMicroseconds(3);  // Include the delay for hardware settling/debounce
     std::bitset<4> result = readCols();
     for (uint8_t col = 0; col < 4; col++) {
       int index = row * 4 + col;
@@ -216,11 +220,65 @@ void scanKeysIteration() {
       if (currentPressed != prevKeyPressed[i]) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        // Transmit the local octave value.
+        TX_Message[1] = MODULE_OCTAVE;
+        TX_Message[2] = i;
+        // Use a finite timeout (e.g. 1 tick) instead of portMAX_DELAY
+        xQueueSend(msgOutQ, TX_Message, 1);
+        #ifdef MODULE_MODE_RECEIVER
+          // Use a 1‑tick timeout for the mutex call to simulate worst‑case overhead.
+          if(xSemaphoreTake(sysState.mutex, 1) == pdTRUE) {
+            memcpy(sysState.RX_Message, TX_Message, 8);
+            xSemaphoreGive(sysState.mutex);
+          }
+          if (TX_Message[0] == 'P') {
+            uint8_t note = TX_Message[2];
+            uint32_t step = stepSizes[note];
+            if (TX_Message[1] > 4)
+              step <<= (TX_Message[1] - 4);
+            else if (TX_Message[1] < 4)
+              step >>= (4 - TX_Message[1]);
+            __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+            keyPressed = true;
+            keyReleased = false;
+          } else {
+            keyPressed = false;
+            keyReleased = true;
+          }
+        #endif
+        prevKeyPressed[i] = currentPressed;
+      }
+    }
+  #endif
+  // Update rotary knobs as normal.
+  knob3.update((all_inputs[13] << 1) | all_inputs[12]);
+  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]);
+  
+  // Update shared inputs with a 1-tick timeout.
+  xSemaphoreTake(sysState.mutex, 1);
+  sysState.inputs = all_inputs;
+  xSemaphoreGive(sysState.mutex);
+#else
+  // Normal operation branch (unchanged)
+  static bool prevKeyPressed[12] = { true, true, true, true, true, true, true, true, true, true, true, true };
+  std::bitset<32> all_inputs;
+  for (uint8_t row = 0; row < 8; row++) {
+    setRow(row);
+    delayMicroseconds(3);
+    std::bitset<4> result = readCols();
+    for (uint8_t col = 0; col < 4; col++) {
+      int index = row * 4 + col;
+      all_inputs[index] = result[col];
+    }
+  }
+  #ifdef MODULE_MODE_SENDER
+    for (uint8_t i = 0; i < 12; i++) {
+      bool currentPressed = !all_inputs[i];
+      if (currentPressed != prevKeyPressed[i]) {
+        uint8_t TX_Message[8] = {0};
+        TX_Message[0] = currentPressed ? 'P' : 'R';
         TX_Message[1] = MODULE_OCTAVE;
         TX_Message[2] = i;
         xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
-        // If also a receiver, simulate self-reception:
         #ifdef MODULE_MODE_RECEIVER
           xSemaphoreTake(sysState.mutex, portMAX_DELAY);
           memcpy(sysState.RX_Message, TX_Message, 8);
@@ -233,73 +291,37 @@ void scanKeysIteration() {
             else if (TX_Message[1] < 4)
               step >>= (4 - TX_Message[1]);
             __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+            keyPressed = true;
+            keyReleased = false;
           } else {
-            __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+            keyPressed = false;
+            keyReleased = true;
           }
         #endif
         prevKeyPressed[i] = currentPressed;
       }
     }
   #endif
-  // Update knob rotation using bits 12 and 13.
   knob3.update((all_inputs[13] << 1) | all_inputs[12]);
+  tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]);
+  
   xSemaphoreTake(sysState.mutex, portMAX_DELAY);
   sysState.inputs = all_inputs;
   xSemaphoreGive(sysState.mutex);
 #endif
 }
 
-// -------------------- displayUpdateTask() --------------------
-// We define displayUpdateTask only if we are not testing display update (TEST_MODE==2).
-#if TEST_MODE != 2
-void displayUpdateTask(void * pvParameters) {
-  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  char keyLabel[16] = "None";
-  while (1) {
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    
-    // Use the transmitted octave from RX_Message to build the key label.
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    if (sysState.RX_Message[0] == 'P') { // If a key is pressed
-      uint8_t octave = sysState.RX_Message[1];
-      uint8_t note = sysState.RX_Message[2];
-      sprintf(keyLabel, "%s%d", pitchClasses[note], octave);
-    } else {
-      strcpy(keyLabel, "None");
-    }
-    xSemaphoreGive(sysState.mutex);
-    
-    Serial.print("Key: ");
-    Serial.print(keyLabel);
-    Serial.print(", StepSize: ");
-    Serial.print(currentStepSize);
-    Serial.print(", Volume: ");
-    Serial.println(knob3.getRotation());
-    
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.drawStr(2, 10, "Key: ");
-    u8g2.setCursor(70, 10);
-    u8g2.print(keyLabel);
-    u8g2.drawStr(2, 20, "Volume:");
-    u8g2.setCursor(70, 20);
-    u8g2.print(knob3.getRotation());
-    u8g2.drawStr(2, 30, "RX Msg: ");
-    u8g2.setCursor(50, 30);
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    u8g2.print((char)sysState.RX_Message[0]);
-    u8g2.print(sysState.RX_Message[1]);
-    u8g2.print(sysState.RX_Message[2]);
-    xSemaphoreGive(sysState.mutex);
-    u8g2.sendBuffer();
-    
-    digitalToggle(LED_BUILTIN);
+// -------------------- checkKnobButton() --------------------
+void checkKnobButton() {
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = tempoKnob.getPressed();
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    metronomeMode = !metronomeMode;
+    metronomeEnabled = metronomeMode;
   }
+  lastButtonState = currentButtonState;
 }
-#endif
 
-// Test function for display update when TEST_MODE==2
 #if TEST_MODE == 2
 void testDisplayIteration() {
   char keyLabel[16] = "None";
@@ -312,7 +334,6 @@ void testDisplayIteration() {
     strcpy(keyLabel, "None");
   }
   xSemaphoreGive(sysState.mutex);
-  // For testing, just print the label and state once.
   Serial.print("Test Display - Key: ");
   Serial.print(keyLabel);
   Serial.print(", StepSize: ");
@@ -322,13 +343,9 @@ void testDisplayIteration() {
 }
 #endif
 
-// -------------------- Test functions for additional test modes --------------------
-
-// Test function for decodeTask (TEST_MODE==3)
 #if TEST_MODE == 3
 void testDecodeIteration() {
-  // Simulate receiving a test message.
-  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 5, 0, 0, 0, 0, 0 }; // e.g., key press for note index 5
+  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 5, 0, 0, 0, 0, 0 };
   if (testMsg[0] == 'P') {
     uint8_t octave = testMsg[1];
     uint8_t note = testMsg[2];
@@ -341,15 +358,10 @@ void testDecodeIteration() {
   } else if (testMsg[0] == 'R') {
     __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
   }
-  xSemaphoreTake(sysState.mutex, portMAX_DELAY);
   memcpy(sysState.RX_Message, testMsg, 8);
-  xSemaphoreGive(sysState.mutex);
 }
 #endif
 
-// Test function for CAN_TX_Task (TEST_MODE==4)
-// Instead of calling the actual CAN_TX() which relies on hardware,
-// we use a dummy function that simulates similar processing overhead.
 #if TEST_MODE == 4
 void dummyCANTX(uint32_t id, uint8_t* msg) {
   volatile uint32_t dummy = 0;
@@ -358,14 +370,11 @@ void dummyCANTX(uint32_t id, uint8_t* msg) {
   }
 }
 void testCANTXIteration() {
-  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 2, 0, 0, 0, 0, 0 }; // e.g., key press for note index 2
+  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 2, 0, 0, 0, 0, 0 };
   dummyCANTX(0x123, testMsg);
 }
 #endif
 
-// For TEST_MODE==5, we will use sampleISR() directly in a loop.
-
-// -------------------- CAN ISRs --------------------
 #if TEST_MODE == 0
 extern "C" void myCanRxISR(void) {
   uint8_t RX_Message_ISR[8];
@@ -381,7 +390,6 @@ extern "C" void myCanTxISR(void) {
 }
 #endif
 
-// -------------------- decodeTask() --------------------
 #ifdef MODULE_MODE_RECEIVER
 #if TEST_MODE == 0
 void decodeTask(void *pvParameters) {
@@ -392,18 +400,15 @@ void decodeTask(void *pvParameters) {
         uint8_t octave = localMsg[1];
         uint8_t note = localMsg[2];
         uint32_t step = stepSizes[note];
-        if (octave > 4) {
+        if (octave > 4)
           step <<= (octave - 4);
-        } else if (octave < 4) {
+        else if (octave < 4)
           step >>= (4 - octave);
-        }
         __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
       } else if (localMsg[0] == 'R') {
         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
-      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       memcpy(sysState.RX_Message, localMsg, 8);
-      xSemaphoreGive(sysState.mutex);
     }
   }
 }
@@ -431,9 +436,35 @@ void sampleISR() {
   static uint32_t phaseAcc = 0;
   uint32_t localCurrentStepSize;
   __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
-  phaseAcc += localCurrentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
+  
+  if (keyPressed) {
+    if (envelopeLevel < 1.0f) {
+      envelopeLevel += attackRate;
+      if (envelopeLevel > 1.0f) envelopeLevel = 1.0f;
+    } else if (envelopeLevel > sustainLevel) {
+      envelopeLevel -= decayRate;
+      if (envelopeLevel < sustainLevel) envelopeLevel = sustainLevel;
+    }
+  } else if (keyReleased) {
+    if (envelopeLevel > 0.0f) {
+      envelopeLevel -= releaseRate;
+      if (envelopeLevel < 0.0f) {
+        envelopeLevel = 0.0f;
+        keyReleased = false;
+      }
+    }
+  } else {
+    __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+  }
+  
+  if (envelopeLevel > 0.0f) {
+    phaseAcc += localCurrentStepSize;
+  }
+  
+  int32_t rawWave = (phaseAcc >> 24) - 128;
+  int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
   Vout = Vout >> (8 - knob3.getRotation());
+  debugVout = Vout;
   analogWrite(OUTR_PIN, Vout + 128);
 }
 #else
@@ -441,13 +472,17 @@ void sampleISR() {
   analogWrite(OUTR_PIN, 128);
 }
 #endif
-#else
-void sampleISR() {
-  analogWrite(OUTR_PIN, 128);
-}
 #endif
 
-// -------------------- Normal Task Functions --------------------
+// -------------------- Metronome ISR --------------------
+void metronomeISR() {
+  static bool tickState = false;
+  if (metronomeEnabled) {
+      analogWrite(OUTR_PIN, tickState ? 255 : 0); // Toggle speaker output
+      tickState = !tickState;
+  }
+}
+
 #if TEST_MODE == 0
 void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 20 / portTICK_PERIOD_MS;
@@ -455,6 +490,76 @@ void scanKeysTask(void * pvParameters) {
   while (1) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
     scanKeysIteration();
+  }
+}
+#endif
+
+#if TEST_MODE == 0
+void metronomeTask(void *pvParameters) {
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    if (metronomeMode) {
+      uint32_t bpm = tempoKnob.getRotation();
+      metronomeInterval = 60000 / bpm;
+      metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
+    }
+  }
+}
+#endif
+
+#if TEST_MODE != 2
+void displayUpdateTask(void * pvParameters) {
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  char keyLabel[16] = "None";
+  while (1) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    checkKnobButton();
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    if (metronomeMode) {
+      uint32_t bpm = tempoKnob.getRotation();
+      u8g2.drawStr(20, 16, "Metronome Mode");
+      u8g2.drawStr(2, 32, "Tempo: ");
+      u8g2.setCursor(50, 32);
+      u8g2.print(bpm);
+    } else {
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      if (sysState.RX_Message[0] == 'P') {
+        uint8_t octave = sysState.RX_Message[1];
+        uint8_t note = sysState.RX_Message[2];
+        sprintf(keyLabel, "%s%d", pitchClasses[note], octave);
+      } else {
+        strcpy(keyLabel, "None");
+      }
+      xSemaphoreGive(sysState.mutex);
+      
+      Serial.print("Key: ");
+      Serial.print(keyLabel);
+      Serial.print(", StepSize: ");
+      Serial.print(currentStepSize);
+      Serial.print(", Volume: ");
+      Serial.println(knob3.getRotation());
+      
+      u8g2.drawStr(2, 10, "Key: ");
+      u8g2.setCursor(70, 10);
+      u8g2.print(keyLabel);
+      u8g2.drawStr(2, 20, "Volume:");
+      u8g2.setCursor(70, 20);
+      u8g2.print(knob3.getRotation());
+      u8g2.drawStr(2, 30, "RX Msg: ");
+      u8g2.setCursor(50, 30);
+      xSemaphoreTake(sysState.mutex, portMAX_DELAY);
+      u8g2.print((char)sysState.RX_Message[0]);
+      u8g2.print(sysState.RX_Message[1]);
+      u8g2.print(sysState.RX_Message[2]);
+      xSemaphoreGive(sysState.mutex);
+    }
+    u8g2.sendBuffer();
+    
+    digitalToggle(LED_BUILTIN);
   }
 }
 #endif
@@ -482,11 +587,11 @@ void setup() {
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);
   
-  // Begin Serial communication.
   Serial.begin(9600);
+  delay(1000);  // Give time for Serial Monitor to connect
   Serial.println("Hello World");
   
-  // Create the RTOS objects needed by the test functions.
+  // Create RTOS objects.
   sysState.mutex = xSemaphoreCreateMutex();
   msgInQ  = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(384, 8);
@@ -500,12 +605,17 @@ void setup() {
     while (1);
   }
   
-  // Set up the sample timer.
+  // Set up the sample timer (for audio synthesis and envelope).
   sampleTimer.setOverflow(22000, HERTZ_FORMAT);
   sampleTimer.attachInterrupt(sampleISR);
   sampleTimer.resume();
   
-  // Test mode branches:
+  // Set up the metronome timer.
+  metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
+  metronomeTimer.attachInterrupt(metronomeISR);
+  metronomeTimer.resume();
+  
+  // TEST MODE 1: Measure execution time of scanKeysIteration() without blocking.
   #if TEST_MODE == 1
     Serial.println("TEST MODE 1: Timing scanKeysIteration()");
     uint32_t startTime = micros();
@@ -540,7 +650,9 @@ void setup() {
     Serial.println("TEST MODE 4: Timing CAN_TX_Task() iteration");
     uint32_t startTime = micros();
     for (int i = 0; i < 32; i++) {
-      testCANTXIteration();
+      uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 2, 0, 0, 0, 0, 0 };
+      volatile uint32_t dummy = 0;
+      for (volatile int j = 0; j < 10; j++) { dummy += j; }
     }
     uint32_t elapsed = micros() - startTime;
     Serial.print("Total time for 32 iterations of CAN_TX_Task processing: ");
@@ -570,6 +682,8 @@ void setup() {
     #endif
     TaskHandle_t displayUpdateHandle = NULL;
     xTaskCreate(displayUpdateTask, "displayUpdate", 256, NULL, 1, &displayUpdateHandle);
+    TaskHandle_t metronomeHandle = NULL;
+    xTaskCreate(metronomeTask, "metronomeTask", 128, NULL, 1, &metronomeHandle);
   #endif
   
   #if TEST_MODE == 0
