@@ -2,9 +2,6 @@
 #define MODULE_MODE_SENDER       // Enable sending: local key changes will be transmitted
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
-// Set the module's octave (1-7); this is used locally when sending.
-// #define MODULE_OCTAVE 4
-
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
 // 1 = test scanKeysIteration() execution time        : ~3251 µs for 32 iterations (~101.6 µs per iteration)
@@ -289,7 +286,7 @@ void scanKeysIteration() {
       if (currentPressed != prevKeyPressed[i]) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        TX_Message[1] = MODULE_OCTAVE;
+        TX_Message[1] = octaveKnob.getRotation();
         TX_Message[2] = i;
         // Use a finite timeout (e.g. 1 tick) instead of portMAX_DELAY
         xQueueSend(msgOutQ, TX_Message, 1);
@@ -311,6 +308,7 @@ void scanKeysIteration() {
   #endif
   // Update rotary knobs as normal.
   volumeKnob.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  octaveKnob.update((all_inputs[15] << 1) | all_inputs[14], all_inputs[20]); // Knob 2
   tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   // Update shared inputs with a 1-tick timeout.
@@ -330,14 +328,13 @@ void scanKeysIteration() {
       all_inputs[index] = result[col];
     }
   }
-  uint8_t moduleOctave = octaveKnob.getRotation();
   #ifdef MODULE_MODE_SENDER
     for (uint8_t i = 0; i < 12; i++) {
       bool currentPressed = !all_inputs[i];
       if (currentPressed != prevKeyPressed[i]) {
         uint8_t TX_Message[8] = {0};
         TX_Message[0] = currentPressed ? 'P' : 'R';
-        TX_Message[1] = moduleOctave;
+        TX_Message[1] = octaveKnob.getRotation();
         TX_Message[2] = i;
         xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
         #ifdef MODULE_MODE_RECEIVER
@@ -407,7 +404,7 @@ void testDisplayIteration() {
 
 #if TEST_MODE == 3
 void testDecodeIteration() {
-  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 5, 0, 0, 0, 0, 0 };
+  uint8_t testMsg[8] = { 'P', octaveKnob.getRotation(), 5, 0, 0, 0, 0, 0 };
   uint8_t octave = testMsg[1];
   uint8_t note = testMsg[2];
   uint32_t step = stepSizes[note];
@@ -428,7 +425,7 @@ void dummyCANTX(uint32_t id, uint8_t* msg) {
   }
 }
 void testCANTXIteration() {
-  uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 2, 0, 0, 0, 0, 0 };
+  uint8_t testMsg[8] = { 'P', octaveKnob.getRotation(), 2, 0, 0, 0, 0, 0 };
   dummyCANTX(0x123, testMsg);
 }
 #endif
@@ -763,7 +760,7 @@ void setup() {
     Serial.println("TEST MODE 4: Timing CAN_TX_Task() iteration");
     uint32_t startTime = micros();
     for (int i = 0; i < 32; i++) {
-      uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 2, 0, 0, 0, 0, 0 };
+      uint8_t testMsg[8] = { 'P', octaveKnob.getRotation(), 2, 0, 0, 0, 0, 0 };
       volatile uint32_t dummy = 0;
       for (volatile int j = 0; j < 10; j++) { dummy += j; }
     }
