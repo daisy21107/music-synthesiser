@@ -2,11 +2,8 @@
 #define MODULE_MODE_SENDER       // Enable sending: local key changes will be transmitted
 #define MODULE_MODE_RECEIVER     // Enable receiving: incoming messages will be decoded and displayed
 
-// We will need to set 1 keyboard to be both Sender & Receiver.
-// Other 2 keyboards will be only the Sender (so that only one keyboard plays the sound)
-
 // Set the module's octave (0-8); this is used locally when sending.
-#define MODULE_OCTAVE 4
+#define MODULE_OCTAVE 5
 
 // Set TEST_MODE as follows:
 // 0 = normal operation (original main.cpp)
@@ -15,8 +12,9 @@
 // 3 = test decodeTask() processing iteration         : ~129 µs for 32 iterations (~4 µs per iteration)
 // 4 = test CAN_TX_Task() processing iteration        : ~74 µs for 32 iterations (~2.3 µs per iteration)
 // 5 = test sampleISR() execution time                : ~290 µs for 32 iterations (~9 µs per iteration)
+// 6 = test metronomeTask() iteration                 : ~146 µs for 32 iterations (~4.6 µs per iteration)
 #ifndef TEST_MODE
-  #define TEST_MODE 5
+  #define TEST_MODE 0
 #endif
 
 #if TEST_MODE != 0
@@ -375,6 +373,19 @@ void testCANTXIteration() {
 }
 #endif
 
+// -------------------- Test function: Metronome Iteration --------------------
+#if TEST_MODE == 6
+// This function simulates one iteration of the metronome task—that is,
+// it reads the tempo knob, computes the metronomeInterval, and updates the timer.
+void testMetronomeIteration() {
+  if (metronomeMode) {  // Only if metronome mode is active
+    uint32_t bpm = tempoKnob.getRotation();
+    metronomeInterval = 60000 / bpm;
+    metronomeTimer.setOverflow(metronomeInterval * 1000, MICROSEC_FORMAT);
+  }
+}
+#endif
+
 #if TEST_MODE == 0
 extern "C" void myCanRxISR(void) {
   uint8_t RX_Message_ISR[8];
@@ -400,14 +411,23 @@ void decodeTask(void *pvParameters) {
         uint8_t octave = localMsg[1];
         uint8_t note = localMsg[2];
         uint32_t step = stepSizes[note];
+        // Adjust step size based on octave
         if (octave > 4)
           step <<= (octave - 4);
         else if (octave < 4)
           step >>= (4 - octave);
         __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-      } else if (localMsg[0] == 'R') {
-        __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+        keyPressed = true;
+        keyReleased = false;
+
+      } else if (localMsg[0] == 'R') {  // Key Released
+        
+        keyPressed = false;
+        keyReleased = true;
+      //  __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
       }
+
+      // Store the received message (for debugging)
       memcpy(sysState.RX_Message, localMsg, 8);
     }
   }
@@ -451,12 +471,12 @@ void sampleISR() {
       if (envelopeLevel < 0.0f) {
         envelopeLevel = 0.0f;
         keyReleased = false;
+        __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED); // Stop the sound AFTER the envelope finishes
       }
     }
-  } else {
-    __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
   }
-  
+
+  // Phase accumulation should continue until the envelope reaches zero
   if (envelopeLevel > 0.0f) {
     phaseAcc += localCurrentStepSize;
   }
@@ -465,12 +485,18 @@ void sampleISR() {
   int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
   Vout = Vout >> (8 - knob3.getRotation());
   debugVout = Vout;
-  analogWrite(OUTR_PIN, Vout + 128);
+
+  // Continue output until the envelope decays to zero
+  if (envelopeLevel > 0.0f) {
+    analogWrite(OUTR_PIN, Vout + 128); 
+  } else {
+    analogWrite(OUTR_PIN, 128);  // Default silence value
+}
 }
 #else
 void sampleISR() {
   analogWrite(OUTR_PIN, 128);
-}
+  }
 #endif
 #endif
 
@@ -668,6 +694,26 @@ void setup() {
     Serial.print("Total time for 32 iterations of sampleISR(): ");
     Serial.println(elapsed);
     while(1);
+  #elif TEST_MODE == 6
+    // New test mode for metronome task iteration.
+    Serial.println("TEST MODE 6: Timing metronomeTask() iteration");
+    // Ensure metronome mode is active (for testing, you might force it on):
+    metronomeMode = true;
+    metronomeEnabled = true;
+    // Optionally, set a fixed tempo.
+    // For example, force tempoKnob rotation to 120 BPM:
+    // (Assuming getRotation() returns an integer BPM; adjust as needed.)
+    // You might want to add a setter in your knob class.
+    // Here we assume tempoKnob.getRotation() will now return 120.
+    
+    uint32_t startTime = micros();
+    for (int i = 0; i < 32; i++) {
+      testMetronomeIteration();
+    }
+    uint32_t elapsed = micros() - startTime;
+    Serial.print("Total time for 32 iterations of metronomeTask(): ");
+    Serial.println(elapsed);
+    while (1);
   #else
     // Normal operation: create tasks and start scheduler.
     TaskHandle_t scanKeysHandle = NULL;
