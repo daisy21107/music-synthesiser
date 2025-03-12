@@ -88,16 +88,11 @@ const int DRST_BIT = 4;
 const int HKOW_BIT = 5;
 const int HKOE_BIT = 6;
 
-// -------------------- Global Variable for Audio Generation --------------------
-volatile uint32_t currentStepSize = 0;
-
 // -------------------- ADSR Envelope Variables --------------------
 const float attackRate   = 0.001f;   // Attack increment
 const float decayRate    = 0.001f;    // Decay decrement until sustain
 const float sustainLevel = 0.6f;      // Sustain level
 const float releaseRate  = 0.00005f;   // Release decrement
-// std::atomic<bool> keyPressed(false);
-// std::atomic<bool> keyReleased(false);
 
 // -------------------- Polyphony Data Structures --------------------
 #define MAX_VOICES 12  // Maximum simultaneous voices
@@ -302,18 +297,9 @@ void scanKeysIteration() {
             xSemaphoreGive(sysState.mutex);
           }
           if (TX_Message[0] == 'P') {
-            uint8_t note = TX_Message[2];
-            uint32_t step = stepSizes[note];
-            if (TX_Message[1] > 4)
-              step <<= (TX_Message[1] - 4);
-            else if (TX_Message[1] < 4)
-              step >>= (4 - TX_Message[1]);
-            __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-            keyPressed.store(true, std::memory_order_relaxed);
-            keyReleased.store(false, std::memory_order_relaxed);
+            startVoice(TX_Message[2], TX_Message[1]);
           } else {
-            keyPressed.store(false, std::memory_order_relaxed);
-            keyReleased.store(true, std::memory_order_relaxed);
+            releaseVoice(TX_Message[2], TX_Message[1]);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -356,19 +342,8 @@ void scanKeysIteration() {
           xSemaphoreGive(sysState.mutex);
           if (TX_Message[0] == 'P') { // Key pressed
             startVoice(TX_Message[2], TX_Message[1]);
-            // uint8_t note = TX_Message[2];
-            // uint32_t step = stepSizes[note];
-            // if (TX_Message[1] > 4)
-            //   step <<= (TX_Message[1] - 4);
-            // else if (TX_Message[1] < 4)
-            //   step >>= (4 - TX_Message[1]);
-            // __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-            // keyPressed.store(true, std::memory_order_relaxed);
-            // keyReleased.store(false, std::memory_order_relaxed);
           } else { // Key released
             releaseVoice(TX_Message[2], TX_Message[1]);
-            // keyPressed.store(false, std::memory_order_relaxed);
-            // keyReleased.store(true, std::memory_order_relaxed);
           }
         #endif
         prevKeyPressed[i] = currentPressed;
@@ -409,8 +384,6 @@ void testDisplayIteration() {
   xSemaphoreGive(sysState.mutex);
   Serial.print("Test Display - Key: ");
   Serial.print(keyLabel);
-  Serial.print(", StepSize: ");
-  Serial.print(currentStepSize);
   Serial.print(", Volume: ");
   Serial.println(knob3.getRotation());
 }
@@ -419,17 +392,13 @@ void testDisplayIteration() {
 #if TEST_MODE == 3
 void testDecodeIteration() {
   uint8_t testMsg[8] = { 'P', MODULE_OCTAVE, 5, 0, 0, 0, 0, 0 };
+  uint8_t octave = testMsg[1];
+  uint8_t note = testMsg[2];
+  uint32_t step = stepSizes[note];
   if (testMsg[0] == 'P') {
-    uint8_t octave = testMsg[1];
-    uint8_t note = testMsg[2];
-    uint32_t step = stepSizes[note];
-    if (octave > 4)
-      step <<= (octave - 4);
-    else if (octave < 4)
-      step >>= (4 - octave);
-    __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+    startVoice(note, octave);
   } else if (testMsg[0] == 'R') {
-    __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+    releaseVoice(note, octave);
   }
   memcpy(sysState.RX_Message, testMsg, 8);
 }
@@ -484,22 +453,8 @@ void decodeTask(void *pvParameters) {
     if (xQueueReceive(msgInQ, localMsg, portMAX_DELAY) == pdTRUE) {
       if (localMsg[0] == 'P') {
         startVoice(localMsg[2], localMsg[1]);
-        // uint8_t octave = localMsg[1];
-        // uint8_t note = localMsg[2];
-        // uint32_t step = stepSizes[note];
-        // // Adjust step size based on octave
-        // if (octave > 4)
-        //   step <<= (octave - 4);
-        // else if (octave < 4)
-        //   step >>= (4 - octave);
-        // __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
-        // keyPressed.store(true, std::memory_order_relaxed);
-        // keyReleased.store(false, std::memory_order_relaxed);
-
       } else if (localMsg[0] == 'R') {  // Key Released
         releaseVoice(localMsg[2], localMsg[1]);
-        // keyPressed.store(false, std::memory_order_relaxed);
-        // keyReleased.store(true, std::memory_order_relaxed);
       }
 
       // Store the received message (for debugging)
@@ -598,46 +553,6 @@ void sampleISR() {
     Vout_total = -128;
 
   analogWrite(OUTR_PIN, Vout_total + 128);
-
-//   static float envelopeLevel = 0.0f;   // 0.0 to 1.0
-//   static uint32_t phaseAcc = 0;
-//   uint32_t localCurrentStepSize;
-//   __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
-  
-//   if (keyPressed.load(std::memory_order_relaxed)) {
-//     if (envelopeLevel < 1.0f) {
-//       envelopeLevel += attackRate;
-//       if (envelopeLevel > 1.0f) envelopeLevel = 1.0f;
-//     } else if (envelopeLevel > sustainLevel) {
-//       envelopeLevel -= decayRate;
-//       if (envelopeLevel < sustainLevel) envelopeLevel = sustainLevel;
-//     }
-//   } else if (keyReleased.load(std::memory_order_relaxed)) {
-//     if (envelopeLevel > 0.0f) {
-//       envelopeLevel -= releaseRate;
-//       if (envelopeLevel < 0.0f) {
-//         envelopeLevel = 0.0f;
-//         keyReleased.store(false, std::memory_order_relaxed);
-//         __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED); // Stop the sound AFTER the envelope finishes
-//       }
-//     }
-//   }
-
-//   // Phase accumulation should continue until the envelope reaches zero
-//   if (envelopeLevel > 0.0f) {
-//     phaseAcc += localCurrentStepSize;
-//   }
-  
-//   int32_t rawWave = (phaseAcc >> 24) - 128;
-//   int32_t Vout = static_cast<int32_t>(rawWave * envelopeLevel);
-//   Vout = Vout >> (8 - knob3.getRotation());
-
-//   // Continue output until the envelope decays to zero
-//   if (envelopeLevel > 0.0f) {
-//     analogWrite(OUTR_PIN, Vout + 128); 
-//   } else {
-//     analogWrite(OUTR_PIN, 128);  // Default silence value
-//   }
 }
 #else
 void sampleISR() {
@@ -711,8 +626,6 @@ void displayUpdateTask(void * pvParameters) {
       
       Serial.print("Key: ");
       Serial.print(keyLabel);
-      Serial.print(", StepSize: ");
-      Serial.print(currentStepSize);
       Serial.print(", Volume: ");
       Serial.println(knob3.getRotation());
       
