@@ -158,8 +158,8 @@ public:
   }
 };
 
-Knob knob3(0, 8);
-Knob tempoKnob(40, 240);
+Knob volumeKnob(0, 8);      // Knob 3
+Knob tempoKnob(40, 240);    // Knob 0
 
 // -------------------- Timers & Display --------------------
 HardwareTimer sampleTimer(TIM1);
@@ -307,7 +307,7 @@ void scanKeysIteration() {
     }
   #endif
   // Update rotary knobs as normal.
-  knob3.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  volumeKnob.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
   tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   // Update shared inputs with a 1-tick timeout.
@@ -350,7 +350,7 @@ void scanKeysIteration() {
       }
     }
   #endif
-  knob3.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
+  volumeKnob.update((all_inputs[13] << 1) | all_inputs[12], all_inputs[21]); // Knob 3
   tempoKnob.update((all_inputs[19] << 1) | all_inputs[18], all_inputs[24]); // Knob 0
   
   xSemaphoreTake(sysState.mutex, portMAX_DELAY);
@@ -385,7 +385,7 @@ void testDisplayIteration() {
   Serial.print("Test Display - Key: ");
   Serial.print(keyLabel);
   Serial.print(", Volume: ");
-  Serial.println(knob3.getRotation());
+  Serial.println(volumeKnob.getRotation());
 }
 #endif
 
@@ -544,7 +544,7 @@ void sampleISR() {
   }
 
   // Volume control
-  Vout_total = Vout_total >> (8 - knob3.getRotation());
+  Vout_total = Vout_total >> (8 - volumeKnob.getRotation());
 
   // Clip Vout
   if (Vout_total > 127)
@@ -627,14 +627,14 @@ void displayUpdateTask(void * pvParameters) {
       Serial.print("Key: ");
       Serial.print(keyLabel);
       Serial.print(", Volume: ");
-      Serial.println(knob3.getRotation());
+      Serial.println(volumeKnob.getRotation());
       
       u8g2.drawStr(2, 10, "Key: ");
       u8g2.setCursor(70, 10);
       u8g2.print(keyLabel);
       u8g2.drawStr(2, 20, "Volume:");
       u8g2.setCursor(70, 20);
-      u8g2.print(knob3.getRotation());
+      u8g2.print(volumeKnob.getRotation());
       u8g2.drawStr(2, 30, "RX Msg: ");
       u8g2.setCursor(50, 30);
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
