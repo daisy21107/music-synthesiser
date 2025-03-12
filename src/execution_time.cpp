@@ -38,6 +38,7 @@
 QueueHandle_t msgInQ  = NULL;   // For incoming CAN messages
 QueueHandle_t msgOutQ = NULL;   // For outgoing CAN messages
 SemaphoreHandle_t CAN_TX_Semaphore = NULL;  // Counting semaphore for TX mailboxes
+SemaphoreHandle_t voicesMutex;
 
 // -------------------- System State --------------------
 struct {
@@ -202,60 +203,68 @@ void setRow(uint8_t rowIdx) {
 // -------------------- Helper Functions for Note Allocation --------------------
 // Called on key press to start a new voice.
 void startVoice(uint8_t note, uint8_t octave) {
-  // Check if the same note is already active
-  for (int i = 0; i < MAX_VOICES; i++) {
-    if (voices[i].active && voices[i].note == note && voices[i].octave == octave) {
-      // Re-trigger the same voice immediately
-      voices[i].keyPressed = true;
-      voices[i].keyReleased = false;
-      voices[i].envelopeLevel = 0.0f;
-      voices[i].phaseAcc = 0;
-      return;
+  if (xSemaphoreTake(voicesMutex, portMAX_DELAY) == pdTRUE) {
+    // Check if the same note is already active
+    for (int i = 0; i < MAX_VOICES; i++) {
+      if (voices[i].active && voices[i].note == note && voices[i].octave == octave) {
+        // Re-trigger the same voice immediately
+        voices[i].keyPressed = true;
+        voices[i].keyReleased = false;
+        voices[i].envelopeLevel = 0.0f;
+        voices[i].phaseAcc = 0;
+        xSemaphoreGive(voicesMutex);
+        return;
+      }
     }
-  }
-  // No active voice for this note found: allocate a new voice/find free voice slot
-  for (int i = 0; i < MAX_VOICES; i++) {
-    if (!voices[i].active) {
-      voices[i].active = true;
-      voices[i].note = note;
-      voices[i].octave = octave;
-      voices[i].stepSize = stepSizes[note];
-      if (octave > 4)
-        voices[i].stepSize <<= (octave - 4);
-      else if (octave < 4)
-        voices[i].stepSize >>= (4 - octave);
-      voices[i].phaseAcc = 0;
-      voices[i].envelopeLevel = 0.0f; // start at 0; will ramp up in ISR
-      voices[i].keyPressed = true;
-      voices[i].keyReleased = false;
-      return;
+    // No active voice for this note found: allocate a new voice/find free voice slot
+    for (int i = 0; i < MAX_VOICES; i++) {
+      if (!voices[i].active) {
+        voices[i].active = true;
+        voices[i].note = note;
+        voices[i].octave = octave;
+        voices[i].stepSize = stepSizes[note];
+        if (octave > 4)
+          voices[i].stepSize <<= (octave - 4);
+        else if (octave < 4)
+          voices[i].stepSize >>= (4 - octave);
+        voices[i].phaseAcc = 0;
+        voices[i].envelopeLevel = 0.0f; // start at 0; will ramp up in ISR
+        voices[i].keyPressed = true;
+        voices[i].keyReleased = false;
+        xSemaphoreGive(voicesMutex);
+        return;
+      }
     }
+    // If no free voice is found, steal the first voice (simple voice stealing)
+    int i = 0;
+    voices[i].active = true;
+    voices[i].note = note;
+    voices[i].octave = octave;
+    voices[i].stepSize = stepSizes[note];
+    if (octave > 4)
+      voices[i].stepSize <<= (octave - 4);
+    else if (octave < 4)
+      voices[i].stepSize >>= (4 - octave);
+    voices[i].phaseAcc = 0;
+    voices[i].envelopeLevel = 0.0f;
+    voices[i].keyPressed = true;
+    voices[i].keyReleased = false;
+    xSemaphoreGive(voicesMutex);
   }
-  // If no free voice is found, steal the first voice (simple voice stealing)
-  int i = 0;
-  voices[i].active = true;
-  voices[i].note = note;
-  voices[i].octave = octave;
-  voices[i].stepSize = stepSizes[note];
-  if (octave > 4)
-    voices[i].stepSize <<= (octave - 4);
-  else if (octave < 4)
-    voices[i].stepSize >>= (4 - octave);
-  voices[i].phaseAcc = 0;
-  voices[i].envelopeLevel = 0.0f;
-  voices[i].keyPressed = true;
-  voices[i].keyReleased = false;
 }
   
 // Called on key release to mark the voice as released.
 void releaseVoice(uint8_t note, uint8_t octave) {
-  // Search for a voice that matches the note and octave and is still active.
-  for (int i = 0; i < MAX_VOICES; i++) {
-    if (voices[i].active && voices[i].note == note && voices[i].octave == octave && voices[i].keyPressed) {
-      voices[i].keyPressed = false;
-      voices[i].keyReleased = true;
-      return;
+  if (xSemaphoreTake(voicesMutex, portMAX_DELAY) == pdTRUE) {
+    // Search for a voice that matches the note and octave and is still active.
+    for (int i = 0; i < MAX_VOICES; i++) {
+      if (voices[i].active && voices[i].note == note && voices[i].octave == octave && voices[i].keyPressed) {
+        voices[i].keyPressed = false;
+        voices[i].keyReleased = true;
+        break;
+      }
     }
+    xSemaphoreGive(voicesMutex);
   }
 }
 
@@ -523,45 +532,60 @@ void sampleISR() {
 
   // Iterate over all voices
   for (int i = 0; i < MAX_VOICES; i++) {
-    if (!voices[i].active)
+
+    // Quickly copy the shared Voice into a local variable in a critical section.
+    UBaseType_t uxSaved = portSET_INTERRUPT_MASK_FROM_ISR();
+    Voice localVoice = voices[i];
+    portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved);
+
+    if (!localVoice.active)
       continue;
-    Voice &v = voices[i];
 
     // Update the envelope for this voice.
-    if (v.keyPressed) {
+    if (localVoice.keyPressed) {
       // Attack phase: ramp up envelope until full amplitude
-      if (v.envelopeLevel < 1.0f) {
-        v.envelopeLevel += attackRate;
-        if (v.envelopeLevel > 1.0f)
-          v.envelopeLevel = 1.0f;
+      if (localVoice.envelopeLevel < 1.0f) {
+        localVoice.envelopeLevel += attackRate;
+        if (localVoice.envelopeLevel > 1.0f)
+          localVoice.envelopeLevel = 1.0f;
       }
       // Decay phase: if envelope overshoots sustain, decay down to sustain level
-      else if (v.envelopeLevel > sustainLevel) {
-        v.envelopeLevel -= decayRate;
-        if (v.envelopeLevel < sustainLevel)
-          v.envelopeLevel = sustainLevel;
+      else if (localVoice.envelopeLevel > sustainLevel) {
+        localVoice.envelopeLevel -= decayRate;
+        if (localVoice.envelopeLevel < sustainLevel)
+        localVoice.envelopeLevel = sustainLevel;
       }
     }
-    else if (v.keyReleased) {
+    else if (localVoice.keyReleased) {
       // Release phase: decay envelope to zero
-      if (v.envelopeLevel > 0.0f) {
-        v.envelopeLevel -= releaseRate;
-        if (v.envelopeLevel <= 0.0f) {
-          v.envelopeLevel = 0.0f;
-          v.active = false;  // Voice finished
+      if (localVoice.envelopeLevel > 0.0f) {
+        localVoice.envelopeLevel -= releaseRate;
+        if (localVoice.envelopeLevel <= 0.0f) {
+          localVoice.envelopeLevel = 0.0f;
+
+          // Mark voice inactive in a short critical section.
+          UBaseType_t uxSaved2 = portSET_INTERRUPT_MASK_FROM_ISR();
+          voices[i].active = false;   // Voice finished
+          portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved2);
           continue;
         }
       }
     }
 
     // Phase accumulation should continue until the envelope reaches zero
-    if (v.envelopeLevel > 0.0f)
-      v.phaseAcc += v.stepSize;
+    if (localVoice.envelopeLevel > 0.0f)
+      localVoice.phaseAcc += localVoice.stepSize;
 
-    int32_t rawWave = (v.phaseAcc >> 24) - 128;
-    int32_t voiceOutput = static_cast<int32_t>(rawWave * v.envelopeLevel);
+    int32_t rawWave = (localVoice.phaseAcc >> 24) - 128;
+    int32_t voiceOutput = static_cast<int32_t>(rawWave * localVoice.envelopeLevel);
 
     Vout_total += voiceOutput;
+
+    // Write back the updated phase accumulator and envelopeLevel.
+    UBaseType_t uxSaved3 = portSET_INTERRUPT_MASK_FROM_ISR();
+    voices[i].phaseAcc = localVoice.phaseAcc;
+    voices[i].envelopeLevel = localVoice.envelopeLevel;
+    portCLEAR_INTERRUPT_MASK_FROM_ISR(uxSaved3);
   }
 
   // Volume control
@@ -742,6 +766,11 @@ void setup() {
   
   // Create RTOS objects.
   sysState.mutex = xSemaphoreCreateMutex();
+  voicesMutex = xSemaphoreCreateMutex();
+  if (voicesMutex == NULL) {
+    Serial.println("Error: Could not create voicesMutex");
+  }
+
   msgInQ  = xQueueCreate(36, 8);
   msgOutQ = xQueueCreate(384, 8);
   if (!msgInQ || !msgOutQ) {
